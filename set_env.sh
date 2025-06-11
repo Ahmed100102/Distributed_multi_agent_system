@@ -1,0 +1,7 @@
+export KAFKA_BOOTSTRAP_SERVERS="localhost:9092"
+export ELASTICSEARCH_URL="http://localhost:9200"
+export LLM_PROVIDER="ollama"
+export LLM_ENDPOINT="http://localhost:11434"
+export LLM_MODEL_RCA="qwen3:4b"
+export LLM_MODEL_REMEDIATION="llama3.2:3b"
+export GROQ_API_KEY="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"

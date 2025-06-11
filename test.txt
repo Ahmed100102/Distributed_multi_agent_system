@@ -1,0 +1,26 @@
+# Get all high-severity issues
+GET observix-remediation-*/_search
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "term": { "severity": "HIGH" } }
+      ]
+    }
+  }
+}
+
+# Find remediation plans by root cause
+GET observix-remediation-*/_search
+{
+  "query": {
+    "nested": {
+      "path": "rca.root_causes",
+      "query": {
+        "match": {
+          "rca.root_causes.cause": "network partition"
+        }
+      }
+    }
+  }
+}
