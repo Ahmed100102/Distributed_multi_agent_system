@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Elasticsearch client
 es = Elasticsearch(
-    os.getenv("ELASTICSEARCH_URL", "http://localhost:9200"),
+    os.getenv("ELASTICSEARCH_URL", "http://10.254.117.52:9200"),
     verify_certs=False,
     ssl_show_warn=False
 )
@@ -50,7 +50,7 @@ def check_new_errors(from_time: str = "") -> str:
                 "filter": [
                     {"terms": {"log_level.keyword": ["ERROR", "WARN"]}},
                     {"range": {"@timestamp": {"gt": search_time}}},
-                    {"term": {"type.keyword": "kafka"}}
+                    {"term": {"type.keyword": "vgmlog"}}
                 ],
                 "must_not": [
                     {"term": {"tags.keyword": "_kafka_grok_failure"}}
@@ -59,7 +59,7 @@ def check_new_errors(from_time: str = "") -> str:
         }
 
         # Check if index exists
-        index_pattern = "logstash-kafka-*"
+        index_pattern = "logstash-*"
         if not es.indices.exists(index=index_pattern):
             logger.warning("No indices found for pattern: %s", index_pattern)
             return json.dumps({"status": "success", "logs": [], "total": 0})
