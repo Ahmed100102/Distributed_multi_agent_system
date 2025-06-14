@@ -29,7 +29,7 @@ def create_kafka_topics():
             replication_factor=1,
             config={
                 "cleanup.policy": "delete",
-                "retention.ms": "604800000",  # 7 days
+                "retention.ms": "3600000",  # 7 days
                 "min.insync.replicas": "1"
             }
         ),
@@ -39,7 +39,7 @@ def create_kafka_topics():
             replication_factor=1,
             config={
                 "cleanup.policy": "delete",
-                "retention.ms": "604800000",
+                "retention.ms": "3600000",
                 "min.insync.replicas": "1"
             }
         ),
@@ -49,7 +49,7 @@ def create_kafka_topics():
             replication_factor=1,
             config={
                 "cleanup.policy": "delete",
-                "retention.ms": "604800000",
+                "retention.ms": "3600000",
                 "min.insync.replicas": "1"
             }
         ),

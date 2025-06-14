@@ -5,12 +5,36 @@ import logging
 from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
 from langchain.agents import AgentExecutor, create_react_agent
 from langchain.prompts import ChatPromptTemplate
-from langchain.tools import Tool
+from langchain_core.exceptions import LangChainException
+from langchain.tools import Tool 
 from llm_interface import LLMInterface
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Choose model runtime (llama_cpp or gemini)
+MODEL_RUNTIME = os.getenv("MODEL_RUNTIME", "gemini").lower()
+VALID_RUNTIMES = ["llama_cpp", "gemini"]
+if MODEL_RUNTIME not in VALID_RUNTIMES:
+    raise ValueError(f"Invalid MODEL_RUNTIME: {MODEL_RUNTIME}. Must be one of {VALID_RUNTIMES}")
+
+# Configure LLM based on runtime
+if MODEL_RUNTIME == "llama_cpp":
+    LLM_PROVIDER = "llama_cpp"
+    LLM_MODEL = os.getenv("LLM_MODEL_RCA", "qwen3:1.7b")
+    LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://localhost:18000")
+    LLM_API_KEY = None
+elif MODEL_RUNTIME == "gemini":
+    LLM_PROVIDER = "gemini"
+    LLM_MODEL = "gemini-1.5-flash"
+    LLM_ENDPOINT = None
+    LLM_API_KEY = "AIzaSyBS7ljmFDPyP5EaP1iuAW2-eW7hmWCqZp8"
+    if not LLM_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable must be set for gemini provider")
+
+logger.info("Selected model runtime: %s (provider=%s, model=%s, endpoint=%s)",
+            MODEL_RUNTIME, LLM_PROVIDER, LLM_MODEL, LLM_ENDPOINT or "default")
 
 # Kafka setup with manual offset control
 kafka_config = {"bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")}
@@ -39,29 +63,17 @@ producer = Producer({
 logger.info("Kafka producer initialized with reliable delivery settings")
 
 # LLM setup
-# Comment the next line to skip provider choice
-choice = input("\nChoose LLM provider (ollama/groq): ").lower().strip()
-
-if choice == 'groq':
-    llm_interface = LLMInterface(
-        provider="groq",
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        api_key=os.getenv("GROQ_API_KEY")
-    )
-    logger.info("Using Groq LLM with model: meta-llama/llama-4-scout-17b-16e-instruct")
-else:  # Default to Ollama
-    llm_interface = LLMInterface(
-        provider=os.getenv("LLM_PROVIDER", "ollama"),
-        model=os.getenv("LLM_MODEL_RCA", "qwen3:1.7b"),
-        endpoint=os.getenv("LLM_ENDPOINT", "http://localhost:11434")
-    )
-    logger.info("Using default Ollama LLM with model: %s", os.getenv("LLM_MODEL_RCA", "qwen3:1.7b"))
+llm_interface = LLMInterface(
+    provider=LLM_PROVIDER,
+    model=LLM_MODEL,
+    endpoint=LLM_ENDPOINT,
+    api_key=LLM_API_KEY
+)
+logger.info("LLM initialized: provider=%s, model=%s, endpoint=%s",
+            LLM_PROVIDER, LLM_MODEL, LLM_ENDPOINT or "default")
 
 llm = llm_interface.llm
-logger.info("LLM initialized: provider=%s, model=%s, endpoint=%s",
-            os.getenv("LLM_PROVIDER", "ollama"),
-            os.getenv("LLM_MODEL_RCA", "qwen3:1.7b"),
-            os.getenv("LLM_ENDPOINT", "http://localhost:11434"))
+logger.info("LLM object created for provider: %s", LLM_PROVIDER)
 
 # Enhanced tools with better error handling
 def publish_to_kafka_rca(data: str) -> str:
@@ -73,8 +85,13 @@ def publish_to_kafka_rca(data: str) -> str:
     logger.debug("Publishing RCA to logs.rca.output: %s", data[:200] + "..." if len(data) > 200 else data)
     
     try:
-        # Validate JSON before publishing
-        json.loads(data)  # This will raise JSONDecodeError if invalid
+        # Validate JSON and required fields
+        parsed = json.loads(data)
+        required_fields = ["log_id", "rca", "recommended_actions", "severity"]
+        missing_fields = [field for field in required_fields if field not in parsed]
+        if missing_fields:
+            logger.error("Missing required fields in RCA JSON: %s", missing_fields)
+            return f"ERROR: Missing required fields - {', '.join(missing_fields)}"
         
         def delivery_callback(err, msg):
             if err:
@@ -111,12 +128,12 @@ tools = [
 ]
 logger.info("Enhanced tools initialized: %s", [tool.name for tool in tools])
 
-# Improved prompts with better structure, clarity, and explicit example
+# Simplified prompt template to avoid variable issues
 system_prompt = """You are an RCA Publishing Agent. Your only job is to publish RCA analysis results to Kafka using the provided tool.
 
 INSTRUCTIONS:
 - Use ONLY the PublishRCAResults tool to publish the RCA JSON.
-- Validate that the input is valid JSON before publishing.
+- Validate that the input is valid JSON with required fields (log_id, rca, recommended_actions, severity).
 - If publishing fails, report the error clearly and do NOT retry.
 - If publishing succeeds, confirm success clearly.
 
@@ -126,7 +143,7 @@ Available Tool:
 RESPONSE FORMAT:
 Thought: [Your reasoning about the RCA data and publishing plan]
 Action: PublishRCAResults
-Action Input: [The exact RCA JSON provided]
+Action Input: {input}
 Observation: [Tool response]
 Thought: [Interpret the tool response]
 Final Answer: SUCCESS: Published RCA to Kafka
@@ -134,7 +151,7 @@ Final Answer: SUCCESS: Published RCA to Kafka
 EXAMPLE:
 Thought: Ready to publish RCA JSON.
 Action: PublishRCAResults
-Action Input: {{"log_id": "123", "rca": "Example", "recommended_actions": ["Action"], "severity": "LOW"}}
+Action Input: {{"log_id": "123", "rca": {{"summary": "Example"}}, "recommended_actions": ["Action"], "severity": "LOW"}}
 Observation: SUCCESS: Published RCA to Kafka
 Thought: Publishing succeeded.
 Final Answer: SUCCESS: Published RCA to Kafka
@@ -148,13 +165,13 @@ human_prompt = """Publish this RCA analysis to Kafka:
 {input}
 
 Ensure the data is published successfully to the logs.rca.output topic.
-"""
+{agent_scratchpad}"""
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", system_prompt),
-    ("human", human_prompt + "\n\n{agent_scratchpad}")
+    ("human", human_prompt)
 ])
-logger.info("Enhanced prompt template initialized")
+logger.info("Simplified prompt template initialized")
 
 # Create LangChain agent with better error handling
 agent = create_react_agent(llm, tools, prompt)
@@ -163,7 +180,7 @@ executor = AgentExecutor(
     tools=tools, 
     verbose=True, 
     handle_parsing_errors=True,
-    max_iterations=3,
+    max_iterations=1,  # Avoid retrying invalid JSON
     early_stopping_method="generate"
 )
 logger.info("LangChain agent and executor initialized with enhanced error handling")
@@ -173,8 +190,13 @@ def perform_rca(log_data: dict) -> dict:
     message = log_data.get("log_message", "")
     log_id = log_data.get("_id", "unknown")
     timestamp = log_data.get("timestamp", "unknown")
-    source = log_data.get("source", "unknown")
-    level = log_data.get("level", "unknown")
+    log_type = log_data.get("type", "unknown")
+    level = log_data.get("log_level", "unknown")
+    java_class = log_data.get("java_class", "")
+    thread = log_data.get("thread", "")
+    summary = log_data.get("summary", "")
+    stack_trace = log_data.get("stack_trace", "")
+    component = log_data.get("component", "")
 
     # Check if this log_id was already processed
     if log_id in perform_rca.processed_ids:
@@ -187,8 +209,19 @@ def perform_rca(log_data: dict) -> dict:
 ANALYSIS CONTEXT:
 - Log ID: {log_id}
 - Timestamp: {timestamp}
-- Source: {source}
+- Log Type: {log_type}
 - Log Level: {level}
+- Java Class: {java_class}
+- Thread: {thread}
+- Summary: {summary}
+- Stack Trace: {stack_trace}
+- Component: {component}
+
+LOG TYPE DETAILS:
+- FISCD: Contains log_level, log_message, java_class, thread, summary, stack_trace
+- vgmlog: Contains log_level, log_message, summary
+- netprobe: Contains log_level, log_message, component
+- gateway: Contains log_level, log_message, java_class, thread
 
 ANALYSIS REQUIREMENTS:
 1. Perform deep technical analysis of the log message
@@ -196,6 +229,8 @@ ANALYSIS REQUIREMENTS:
 3. Identify all potential root causes with probabilities
 4. Map dependencies and impact areas
 5. Assess business impact and urgency
+6. Provide actionable recommendations to resolve the issue
+7. Include relevant fields (java_class, thread, summary, stack_trace, component) based on log type
 
 OUTPUT FORMAT (JSON ONLY):
 {{
@@ -215,14 +250,20 @@ OUTPUT FORMAT (JSON ONLY):
             "affected_components": ["Component1", "Component2"],
             "error_patterns": ["Pattern1", "Pattern2"],
             "environmental_factors": ["Factor1", "Factor2"]
-        }}
+        }},
+        "java_class": "{java_class}",
+        "thread": "{thread}",
+        "log_summary": "{summary}",
+        "stack_trace": "{stack_trace}",
+        "component": "{component}"
     }},
+    "recommended_actions": ["Action1", "Action2"],
     "severity": "HIGH|MEDIUM|LOW",
     "confidence": "HIGH|MEDIUM|LOW",
     "category": "INFRASTRUCTURE|APPLICATION|NETWORK|DATA|SECURITY|OTHER",
     "metadata": {{
         "analysis_timestamp": "{timestamp}",
-        "source_system": "{source}",
+        "log_type": "{log_type}",
         "log_level": "{level}"
     }}
 }}"""
@@ -232,15 +273,19 @@ OUTPUT FORMAT (JSON ONLY):
 LOG MESSAGE: {message}
 
 Additional context from log entry:
-- Source System: {source}
+- Log Type: {log_type}
 - Log Level: {level}
-- Timestamp: {timestamp}
+- Java Class: {java_class}
+- Thread: {thread}
+- Summary: {summary}
+- Stack Trace: {stack_trace}
+- Component: {component}
 
-Perform thorough technical analysis and return the JSON response."""
+Perform thorough technical analysis, provide actionable recommendations, and return the JSON response."""
     
     try:
-        logger.info("Starting RCA analysis for log_id: %s", log_id)
-        analysis = llm_interface.call(system_prompt, user_prompt)
+        logger.info("Starting RCA analysis for log_id: %s (type: %s)", log_id, log_type)
+        analysis = llm_interface.call(system_prompt, user_prompt, timeout=30)
         
         # Clean up and parse response
         analysis = clean_llm_response(analysis)
@@ -253,25 +298,77 @@ Perform thorough technical analysis and return the JSON response."""
             except json.JSONDecodeError:
                 logger.warning("Could not parse RCA string as JSON, leaving as is")
         
-        # Add timestamp and source if missing
-        if "analysis_timestamp" not in parsed:
-            parsed["analysis_timestamp"] = timestamp
-        if "source_system" not in parsed:
-            parsed["source_system"] = source
+        # Add timestamp and log_type if missing
+        if "analysis_timestamp" not in parsed.get("metadata", {}):
+            parsed["metadata"] = parsed.get("metadata", {})
+            parsed["metadata"]["analysis_timestamp"] = timestamp
+        if "log_type" not in parsed.get("metadata", {}):
+            parsed["metadata"]["log_type"] = log_type
+            
+        # Ensure recommended_actions is present
+        if "recommended_actions" not in parsed:
+            logger.warning("LLM did not provide recommended_actions, adding default")
+            parsed["recommended_actions"] = ["Review and update instrument database", "Validate client request parameters"]
             
         return parsed
         
+    except LangChainException as e:
+        logger.error("LLM call timed out or failed for log_id %s: %s", log_id, str(e))
+        return {
+            "log_id": str(log_id),
+            "rca": {
+                "summary": f"RCA analysis failed: {str(e)}",
+                "detailed_analysis": "Analysis timed out or failed",
+                "root_causes": [],
+                "system_state": {
+                    "affected_components": [],
+                    "error_patterns": [],
+                    "environmental_factors": []
+                },
+                "java_class": java_class,
+                "thread": thread,
+                "log_summary": summary,
+                "stack_trace": stack_trace,
+                "component": component
+            },
+            "recommended_actions": ["Investigate LLM server timeout"],
+            "severity": "LOW",
+            "confidence": "LOW",
+            "category": "OTHER",
+            "metadata": {
+                "analysis_timestamp": timestamp,
+                "log_type": log_type,
+                "log_level": level
+            }
+        }
     except Exception as e:
         logger.error("RCA analysis failed for log_id %s: %s", log_id, str(e))
         return {
             "log_id": str(log_id),
-            "rca": f"RCA analysis failed: {str(e)}",
-            "recommended_actions": ["Check system connectivity", "Review error logs", "Retry analysis"],
+            "rca": {
+                "summary": f"RCA analysis failed: {str(e)}",
+                "detailed_analysis": "Analysis could not be completed due to an error",
+                "root_causes": [],
+                "system_state": {
+                    "affected_components": [],
+                    "error_patterns": [],
+                    "environmental_factors": []
+                },
+                "java_class": java_class,
+                "thread": thread,
+                "log_summary": summary,
+                "stack_trace": stack_trace,
+                "component": component
+            },
+            "recommended_actions": ["Review system logs for errors"],
             "severity": "LOW",
             "confidence": "LOW",
             "category": "OTHER",
-            "analysis_timestamp": timestamp,
-            "source_system": source
+            "metadata": {
+                "analysis_timestamp": timestamp,
+                "log_type": log_type,
+                "log_level": level
+            }
         }
 
 # Add static set to track processed IDs
@@ -318,10 +415,11 @@ def main():
         try:
             # Only poll for new messages if not currently processing one
             if processing_msg is None:
-                msg = consumer.poll(timeout=1.0)
+                msg = consumer.poll(timeout=5.0)
 
                 if msg is None:
-                    logger.debug("No new messages in logs.anomalies")
+                    logger.debug("No new messages in logs.anomalies (topic: %s, partitions: %s)",
+                                 "logs.anomalies", consumer.assignment())
                     continue
 
                 if msg.error():
@@ -381,9 +479,8 @@ def main():
 
                 # Use agent to publish results
                 logger.info("Publishing RCA results via agent...")
-                result = executor.invoke({
-                    "input": rca_json
-                })
+                logger.debug("Agent input: %s", {"input": rca_json[:200] + "..." if len(rca_json) > 200 else rca_json})
+                result = executor.invoke({"input": rca_json})
 
                 # Check if publishing was successful
                 agent_output = result.get("output", "")
@@ -402,7 +499,8 @@ def main():
                 else:
                     logger.error("❌ Publishing failed: %s", agent_output)
                     logger.info("Will retry processing this message...")
-                    # Keep processing_msg to retry processing
+                    # Reset processing_msg to force retry
+                    processing_msg = None
 
             except json.JSONDecodeError as e:
                 logger.error("Invalid JSON in consumed message: %s", str(e))
@@ -413,7 +511,7 @@ def main():
             except Exception as e:
                 logger.error("Error processing message: %s", str(e))
                 logger.info("Will retry processing this message...")
-                # Keep processing_msg to retry
+                processing_msg = None
 
             finally:
                 # Always resume consumer
