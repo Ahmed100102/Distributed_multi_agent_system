@@ -173,7 +173,7 @@ prompt = ChatPromptTemplate.from_messages([
 ])
 logger.info("Simplified prompt template initialized")
 
-# Create LangChain agent with better error handling
+# Create LangChain agent
 agent = create_react_agent(llm, tools, prompt)
 executor = AgentExecutor(
     agent=agent, 
