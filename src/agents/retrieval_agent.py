@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import sys
 from datetime import datetime, UTC
 from elasticsearch import Elasticsearch, ApiError, TransportError
 from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
@@ -399,7 +400,6 @@ def consume_remediation():
         return f"Error consuming remediation: {str(e)}"
 
 def main():
-    import sys
     from_time = sys.argv[1] if len(sys.argv) > 1 else ""
     if from_time:
         # Run one-time historical query
