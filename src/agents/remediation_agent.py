@@ -21,8 +21,8 @@ if MODEL_RUNTIME not in VALID_RUNTIMES:
 # Configure LLM based on runtime
 if MODEL_RUNTIME == "llama_cpp":
     LLM_PROVIDER = "llama_cpp"
-    LLM_MODEL = os.getenv("LLM_MODEL_RCA", "qwen3:1.7b")
-    LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://localhost:18000")
+    LLM_MODEL = os.getenv("LLM_MODEL_REMEDIATION", "qwen3:1.7b")
+    LLM_ENDPOINT = os.getenv("LLM_MODEL_REMEDIATION", "http://localhost:18000")
     LLM_API_KEY = None
 elif MODEL_RUNTIME == "gemini":
     LLM_PROVIDER = "gemini"
