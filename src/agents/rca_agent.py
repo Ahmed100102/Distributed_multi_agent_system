@@ -27,9 +27,9 @@ if MODEL_RUNTIME == "llama_cpp":
     LLM_API_KEY = None
 elif MODEL_RUNTIME == "gemini":
     LLM_PROVIDER = "gemini"
-    LLM_MODEL = "gemini-1.5-flash"
+    LLM_MODEL = "gemini-2.0-flash"
     LLM_ENDPOINT = None
-    LLM_API_KEY = "AIzaSyBS7ljmFDPyP5EaP1iuAW2-eW7hmWCqZp8"
+    LLM_API_KEY = "AIzaSyCjesXGbLVTL--_jJCQmaGxWf4N-eWUvAQ"
     if not LLM_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable must be set for gemini provider")
 
