@@ -33,7 +33,7 @@ class LLMInterface:
                 raise ValueError("API key required for Gemini")
             return ChatGoogleGenerativeAI(
                 model=self.model,
-                google_api_key="AIzaSyBS7ljmFDPyP5EaP1iuAW2-eW7hmWCqZp8"
+                google_api_key=self.api_key
             )
         elif self.provider == "groq":
             return ChatGroq(
