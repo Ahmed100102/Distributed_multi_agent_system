@@ -207,7 +207,7 @@ class LLMInterface:
 if __name__ == "__main__":
     print("\nTesting Gemini:")
     try:
-        gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyAECBFg1Zl5tAgH4U0S7XDz0eD_R3ijRI0")
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
         if not gemini_api_key:
             raise ValueError("Set GEMINI_API_KEY environment variable or provide it explicitly.")
 
