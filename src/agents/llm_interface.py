@@ -226,7 +226,7 @@ if __name__ == "__main__":
 
     print("\nTesting OpenRouter:")
     try:
-        open_router_api_key = os.getenv("OR_API_KEY", "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")
+        open_router_api_key = os.getenv("OR_API_KEY")
         if not open_router_api_key:
             raise ValueError("Set OR_API_KEY environment variable or provide it explicitly.")
 
