@@ -1,169 +1,91 @@
-# Remediation Agent Documentation
+# Remediation Agent
+
+The `remediation_agent.py` script is responsible for generating detailed remediation plans based on the root cause analysis (RCA) results provided by the RCA Agent.
 
 ## Overview
-The Remediation Agent is responsible for creating and publishing remediation plans based on Root Cause Analysis (RCA) results. It processes RCA outputs and generates actionable steps for issue resolution.
+
+The Remediation Agent is the second step in the automated issue resolution pipeline. It:
+
+1.  Consumes RCA results from the `logs.rca.output` Kafka topic.
+2.  Validates the incoming RCA data.
+3.  Uses a Large Language Model (LLM) to generate a comprehensive remediation plan.
+4.  Publishes the remediation plan to the `logs.remediation` Kafka topic.
+5.  Provides a health check endpoint for monitoring.
 
 ## Architecture
 
-### Components
-1. **Kafka Consumer**
-   - Subscribes to: `logs.rca.output`
-   - Group ID: `remediation_group`
-   - Manual offset control
+The agent's architecture is similar to the RCA Agent, using:
 
-2. **Kafka Producer**
-   - Publishes to: `logs.remediation`
-   - Reliable delivery configuration
-   - Automatic retries
+-   **Kafka:** For consuming RCA results and publishing remediation plans.
+-   **FastAPI:** To provide a `/health` endpoint for monitoring.
+-   **LangGraph:** To orchestrate the remediation workflow.
+-   **LLMInterface:** For interacting with the configured LLM.
 
-3. **LLM Interface**
-   - Uses specified LLM provider
-   - Model: `LLM_MODEL_REMEDIATION`
-   - Generates remediation plans
+## State Management
 
-### Configuration
+The agent's state is managed by the `AgentState` TypedDict, which includes:
 
-#### Kafka Settings
-```python
-kafka_config = {
-    "bootstrap.servers": "localhost:9092",
-    "group.id": "remediation_group",
-    "auto.offset.reset": "earliest",
-    "enable.auto.commit": False,
-    "max.poll.interval.ms": 1800000,
-    "session.timeout.ms": 300000,
-    "heartbeat.interval.ms": 10000
-}
-```
+-   `log_data`: The RCA data from Kafka.
+-   `remediation_result`: The generated remediation plan.
+-   `publish_result`: The status of the Kafka publishing step.
+-   `metrics`: A dictionary for performance metrics.
+-   `processed_ids`: A set to track processed log IDs.
+-   `model_status`: The current status of the LLM.
+-   `current_log_message`: The summary of the RCA being processed.
+-   `validation_passed`: A boolean for input validation success.
 
-#### Producer Settings
-```python
-producer_config = {
-    "acks": "all",
-    "retries": 3,
-    "delivery.timeout.ms": 30000
-}
-```
+## Workflow
 
-## Tools
+The Remediation Agent's workflow is defined as a LangGraph graph:
 
-### PublishKafkaRemediation
-Publishes remediation plans to Kafka topic `logs.remediation`
+1.  **Consume Kafka (`consume_kafka`):** Polls the `logs.rca.output` topic for new messages.
 
-#### Input Format:
-```json
-{
-    "log_id": "unique_identifier",
-    "remediation": {
-        "steps": [
-            {
-                "step_number": 1,
-                "action": "Specific action to take",
-                "purpose": "Why this action helps"
-            }
-        ],
-        "estimated_time": "30m",
-        "required_skills": ["skill1", "skill2"],
-        "precautions": ["precaution1", "precaution2"]
-    },
-    "priority": "HIGH|MEDIUM|LOW"
-}
-```
+2.  **Validate Input (`validate_input`):**
+    -   Checks for valid JSON and required fields (`log_id`, `rca`, `recommended_actions`, `severity`).
+    -   Verifies that the log ID has not been processed before.
 
-## Prompt Engineering
+3.  **Perform Remediation (`perform_remediation`):**
+    -   Constructs a detailed prompt for the LLM using the RCA data.
+    -   Calls the LLM to generate a remediation plan.
+    -   The response is parsed and combined with the original RCA data to create a complete remediation result.
 
-### System Prompt
-The agent uses a structured prompt that:
-- Defines the agent's purpose
-- Specifies validation requirements
-- Provides format guidelines
-- Includes example interactions
+4.  **Publish to Kafka (`publish_to_kafka_remediation`):**
+    -   The full remediation result is published to the `logs.remediation` topic.
 
-### Response Format
-```
-Thought: [Remediation planning process]
-Action: PublishKafkaRemediation
-Action Input: [Remediation JSON]
-Observation: [Tool response]
-Final Answer: [Status confirmation]
-```
+5.  **Commit Message Offset (`commit_message_offset`):**
+    -   Commits the Kafka offset after successful publishing.
 
 ## Error Handling
-1. **Input Validation**
-   - JSON schema validation
-   - Required field checks
-   - Data type verification
 
-2. **Publishing Errors**
-   - Clear error reporting
-   - No automatic retries
-   - Error logging
+The agent has comprehensive error handling. If the LLM fails to generate a remediation plan, a default error result is created and published. This ensures that downstream systems are aware of the failure.
 
-3. **LLM Errors**
-   - Timeout handling
-   - Response validation
-   - Fallback strategies
+## Metrics and Monitoring
 
-## Best Practices
+Metrics are collected for each run and saved to `remediation_metrics.json`. The `/health` endpoint (running on port 8002) provides a detailed view of the agent's status.
 
-### 1. Remediation Plan Quality
-- Include clear, actionable steps
-- Specify prerequisites
-- Note potential risks
-- Estimate time requirements
+### Generated Metrics
 
-### 2. Performance
-- Batch processing when possible
-- Monitor LLM response times
-- Track message processing rates
+The following metrics are generated and can be viewed through the `/health` endpoint:
 
-### 3. Reliability
-- Validate all outputs
-- Handle edge cases
-- Maintain idempotency
+-   **`total_logs_processed`:** The total number of logs processed by the agent.
+-   **`total_errors`:** The total number of errors encountered by the agent.
+-   **`error_rate`:** The rate of errors, calculated as `total_errors / total_logs_processed`.
+-   **`total_input_tokens`:** The total number of input tokens used by the LLM.
+-   **`total_output_tokens`:** The total number of output tokens generated by the LLM.
+-   **`avg_tokens_per_log`:** An object containing the average number of input and output tokens per log.
+-   **`service_uptime_hours`:** The number of hours the agent has been running.
+-   **`last_run`:** Information about the last run, including its status, timestamp, function, and duration.
+-   **`recent_runs`:** A list of the last 10 runs with detailed information for each.
+-   **`average_durations`:** The average duration of the `perform_remediation` and `publish_to_kafka_remediation` functions, including a breakdown of the steps within each function.
 
-## Environment Variables
-- `KAFKA_BOOTSTRAP_SERVERS`: Kafka connection
-- `LLM_PROVIDER`: LLM service provider
-- `LLM_MODEL_REMEDIATION`: Specific model
-- `LLM_ENDPOINT`: API endpoint
+## Configuration
 
-## Dependencies
-- confluent_kafka
-- langchain
-- llm_interface (local)
-- logging
+The agent is configured through environment variables:
 
-## Deployment Considerations
+-   `KAFKA_BOOTSTRAP_SERVERS`: The address of the Kafka bootstrap servers.
+-   `MODEL_RUNTIME`: The LLM provider to use.
+-   API keys and other settings for the chosen LLM provider.
 
-### 1. Scaling
-- Multiple instances possible
-- Kafka partition assignment
-- LLM API capacity planning
+## Persistence
 
-### 2. Monitoring
-- Consumer lag
-- Processing times
-- Error rates
-- Resource usage
-
-### 3. Security
-- Secure Kafka connections
-- API key management
-- Input sanitization
-
-## Testing
-1. **Unit Tests**
-   - Tool functionality
-   - JSON validation
-   - Error handling
-
-2. **Integration Tests**
-   - Kafka connectivity
-   - LLM interactions
-   - End-to-end flows
-
-3. **Load Tests**
-   - Message throughput
-   - Response times
-   - Resource utilization
+To prevent reprocessing of messages, the agent stores the IDs of all processed logs in a `processed_ids.json` file. This file is loaded on startup and updated as new messages are processed.

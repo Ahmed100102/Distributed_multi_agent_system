@@ -1,92 +1,71 @@
-# LLM Interface Documentation
+# LLM Interface
+
+The `llm_interface.py` script provides a standardized interface for interacting with various Large Language Models (LLMs). It supports multiple providers and handles the complexities of initialization, input/output validation, and token counting.
 
 ## Overview
-The LLM Interface module provides a unified interface for interacting with different Large Language Model (LLM) providers. It abstracts away provider-specific implementations, making it easy to switch between different LLM services.
 
-## Features
-- Support for multiple LLM providers:
-  - Ollama (local deployment)
-  - OpenAI
-  - Google Gemini
-  - LLaMA.cpp (planned)
-- Unified prompt formatting
-- Consistent response handling
-- Error management
-- Automatic provider-specific configuration
+The `LLMInterface` class is the core component of this module. It allows you to instantiate a connection to an LLM from a supported provider and make calls to it with a consistent API.
 
-## Class: LLMInterface
+### Key Features
 
-### Constructor
-```python
-def __init__(self, provider: str, model: str, endpoint: Optional[str] = None, api_key: Optional[str] = None)
-```
+- **Multiple Provider Support:** Works with "llama_cpp", "gemini", "groq", "ollama", and "openrouter".
+- **Configuration:** Can be configured via environment variables or by passing parameters directly to the constructor.
+- **Input/Output Validation:** Performs strict validation on prompts and cleans the LLM's output.
+- **Token Counting:** Provides token counts for both input and output, with estimation for providers that don't supply this information.
+- **Timeout Handling:** Implements a timeout mechanism for LLM calls.
+- **Legacy Compatibility:** Includes a wrapper for older code that expects a simple string response.
 
-#### Parameters:
-- `provider` (str): The LLM provider name ("ollama", "openai", "gemini")
-- `model` (str): The specific model to use (e.g., "qwen3:1.7b", "gpt-3.5-turbo")
-- `endpoint` (Optional[str]): API endpoint URL (default: "http://localhost:11434")
-- `api_key` (Optional[str]): API key for authentication with commercial providers
+## `LLMInterface` Class
+
+### Initialization
+
+The `LLMInterface` class can be initialized in two ways:
+
+1.  **Using Environment Variables:** If no parameters are provided to the constructor, the class will use the `MODEL_RUNTIME` environment variable to determine which provider to use. The corresponding configuration will be loaded from the `runtime_configs` dictionary.
+
+2.  **Passing Parameters:** You can explicitly specify the `provider`, `model`, `endpoint`, and `api_key` when creating an instance of the class.
 
 ### Methods
 
-#### call(system_prompt: str, user_prompt: str) -> str
-Makes a call to the LLM with system and user prompts.
+#### `__init__(self, provider: str = None, model: str = None, endpoint: Optional[str] = None, api_key: Optional[str] = None)`
 
-##### Parameters:
-- `system_prompt` (str): Instructions or context for the LLM
-- `system_prompt` (str): The actual query or request
+-   **Description:** Initializes the `LLMInterface` instance.
+-   **Parameters:**
+    -   `provider` (str, optional): The LLM provider to use (e.g., "gemini", "ollama").
+    -   `model` (str, optional): The specific model to use.
+    -   `endpoint` (str, optional): The API endpoint for the LLM service.
+    -   `api_key` (str, optional): The API key for authentication.
 
-##### Returns:
-- str: The processed response from the LLM
+#### `call(self, system_prompt: str, user_prompt: str, timeout: int = 30) -> Tuple[str, Dict[str, int]]`
 
-##### Example:
-```python
-llm = LLMInterface(
-    provider="ollama",
-    model="qwen3:1.7b"
-)
-response = llm.call(
-    system_prompt="You are a helpful assistant",
-    user_prompt="What is the capital of France?"
-)
-```
+-   **Description:** Makes a call to the LLM with the given prompts.
+-   **Parameters:**
+    -   `system_prompt` (str): The system prompt to guide the LLM's behavior.
+    -   `user_prompt` (str): The user's prompt or question.
+    -   `timeout` (int, optional): The timeout for the LLM call in seconds. Defaults to 30.
+-   **Returns:** A tuple containing the LLM's response (as a string) and a dictionary with the input and output token counts.
 
-### Environment Variables
-The module respects the following environment variables:
-- `LLM_PROVIDER`: Default LLM provider
-- `LLM_ENDPOINT`: Default API endpoint URL
-- `LLM_API_KEY`: API key for commercial providers
+#### `call_compatible(self, system_prompt: str, user_prompt: str, timeout: int = 30) -> str`
 
-### Provider-Specific Details
+-   **Description:** A compatibility wrapper for legacy code that returns only the LLM's response as a string.
+-   **Parameters:**
+    -   `system_prompt` (str): The system prompt.
+    -   `user_prompt` (str): The user's prompt.
+    -   `timeout` (int, optional): The timeout for the LLM call. Defaults to 30.
+-   **Returns:** The LLM's response as a string.
 
-#### Ollama
-- Default endpoint: http://localhost:11434
-- No API key required
-- Prompt format: `{system_prompt}\n\n{user_prompt}`
+## Supported Providers
 
-#### OpenAI
-- Requires API key
-- Uses ChatOpenAI from langchain_openai
-- Prompt format: `System: {system_prompt}\nUser: {user_prompt}`
+The `runtime_configs` dictionary defines the configurations for the following providers:
 
-#### Google Gemini
-- Requires API key
-- Uses ChatGoogleGenerativeAI from langchain_google_genai
-- Prompt format: `System: {system_prompt}\nUser: {user_prompt}`
+-   **llama_cpp:** For running GGUF models with a local server.
+-   **gemini:** For using Google's Gemini models.
+-   **groq:** For using models on the Groq platform.
+-   **ollama:** For running models with the Ollama server.
+-   **openrouter:** For accessing various models through the OpenRouter API.
 
-### Error Handling
-- Returns error message if LLM call fails
-- Handles different response types (string, object with content)
-- Removes thinking process tags (`<think>...</think>`)
+## Testing
 
-### Dependencies
-- langchain_ollama
-- langchain_openai
-- langchain_google_genai (imported dynamically)
-- pydantic.SecretStr for secure API key handling
+The script includes a `if __name__ == "__main__"` block for testing the `LLMInterface` with different providers. You can run this script directly to test the functionality.
 
-### Best Practices
-1. Always handle the returned response which might be an error message
-2. Use environment variables for configuration when possible
-3. Consider the specific model capabilities when crafting prompts
-4. Initialize once and reuse the instance for multiple calls
+**Note:** Ensure you have the necessary environment variables set for the providers you want to test (e.g., `GEMINI_API_KEY`, `OR_API_KEY`).

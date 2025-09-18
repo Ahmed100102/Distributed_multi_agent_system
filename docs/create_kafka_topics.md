@@ -1,105 +1,38 @@
-# Kafka Topics Setup Documentation
+# Create Kafka Topics
+
+The `create_kafka_topics.py` script is a utility for setting up the necessary Kafka topics for the Distributed Multi-Agent System. It ensures that the topics are created with the correct configurations for the agents to communicate with each other.
 
 ## Overview
-This module is responsible for creating the required Kafka topics for the log analysis system. It ensures that all necessary topics exist with the correct configuration before the agents start processing.
 
-## Topics Created
+This script connects to a Kafka cluster and creates the following topics:
 
-### 1. logs.anomalies
-- Purpose: Receives initial log anomalies for analysis
-- Consumers: RCA Agent
-- Configuration:
-  - Partitions: 1
-  - Replication Factor: 1
+-   `logs.anomalies`: For publishing new error logs retrieved from Elasticsearch.
+-   `logs.rca.output`: For publishing the results of the Root Cause Analysis (RCA).
+-   `logs.remediation`: For publishing the final remediation plans.
 
-### 2. logs.rca.output
-- Purpose: Stores Root Cause Analysis results
-- Publishers: RCA Agent
-- Consumers: Remediation Agent
-- Configuration:
-  - Partitions: 1
-  - Replication Factor: 1
-
-### 3. logs.remediation
-- Purpose: Stores remediation plans
-- Publishers: Remediation Agent
-- Consumers: Retrieval Agent
-- Configuration:
-  - Partitions: 1
-  - Replication Factor: 1
+If the topics already exist, the script will verify their configuration.
 
 ## Usage
 
-### Command Line
+To run the script, simply execute it from the command line:
+
 ```bash
 python src/create_kafka_topics.py
 ```
 
-### Programmatic Usage
-```python
-from create_kafka_topics import create_kafka_topics
-create_kafka_topics()
-```
+## Topics Created
 
-## Configuration
-- Bootstrap Servers: localhost:9092 (default)
-- Topic settings can be modified in the code
+The script creates the following topics with the specified configurations:
 
-## Error Handling
-- Attempts to create each topic independently
-- Reports success/failure for each topic
-- Continues with remaining topics if one fails
+| Topic Name          | Partitions | Replication Factor | Cleanup Policy | Retention (ms) | Min In-sync Replicas |
+| ------------------- | ---------- | ------------------ | -------------- | -------------- | -------------------- |
+| `logs.anomalies`    | 1          | 1                  | `delete`       | 3600000        | 1                    |
+| `logs.rca.output`   | 1          | 1                  | `delete`       | 3600000        | 1                    |
+| `logs.remediation`  | 1          | 1                  | `delete`       | 3600000        | 1                    |
 
-## Best Practices
+## Verification
 
-### 1. Pre-deployment
-- Run before starting any agents
-- Verify topic creation success
-- Check topic configurations
+After attempting to create the topics, the script will:
 
-### 2. Production Settings
-Consider adjusting for production:
-- Increase replication factor
-- Adjust partition count
-- Set retention policies
-- Configure cleanup policies
-
-### 3. Monitoring
-- Check topic existence
-- Verify configurations
-- Monitor partition count
-- Check replication status
-
-## Dependencies
-- confluent_kafka.admin
-- AdminClient
-- NewTopic
-
-## Security Considerations
-1. **Access Control**
-   - Set appropriate ACLs
-   - Configure authentication
-   - Implement authorization
-
-2. **Network Security**
-   - Secure connections
-   - SSL/TLS configuration
-   - Network isolation
-
-## Troubleshooting
-
-### Common Issues
-1. **Connection Failures**
-   - Check Kafka server status
-   - Verify network connectivity
-   - Check firewall settings
-
-2. **Permission Issues**
-   - Verify user permissions
-   - Check ACL configuration
-   - Review security settings
-
-3. **Topic Existence**
-   - Handle duplicate creation
-   - Check cluster health
-   - Verify broker status
+1.  **Verify Configuration:** If a topic already exists, it will print the existing configuration.
+2.  **List Topics:** It will list all the topics in the cluster to confirm that the required topics are present.

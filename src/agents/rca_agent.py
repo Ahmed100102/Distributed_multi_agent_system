@@ -2,41 +2,61 @@ import os
 import json
 import re
 import logging
+from datetime import datetime, UTC
+from typing import TypedDict, Optional, Dict
 from confluent_kafka import Consumer, Producer, KafkaError, TopicPartition
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain.prompts import ChatPromptTemplate
-from langchain_core.exceptions import LangChainException
-from langchain.tools import Tool 
+from langgraph.graph import StateGraph, END, START
+from fastapi import FastAPI, Response
+from threading import Thread
+import uvicorn
+import uuid
+from statistics import mean
 from llm_interface import LLMInterface
+from langchain_core.exceptions import LangChainException
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Choose model runtime (llama_cpp or gemini)
-MODEL_RUNTIME = os.getenv("MODEL_RUNTIME", "gemini").lower()
-VALID_RUNTIMES = ["llama_cpp", "gemini"]
-if MODEL_RUNTIME not in VALID_RUNTIMES:
-    raise ValueError(f"Invalid MODEL_RUNTIME: {MODEL_RUNTIME}. Must be one of {VALID_RUNTIMES}")
+# Metrics and state storage
+metrics_file = "rca_metrics.json"
 
-# Configure LLM based on runtime
-if MODEL_RUNTIME == "llama_cpp":
-    LLM_PROVIDER = "llama_cpp"
-    LLM_MODEL = os.getenv("LLM_MODEL_RCA", "qwen3:1.7b")
-    LLM_ENDPOINT = os.getenv("LLM_ENDPOINT", "http://localhost:18000")
-    LLM_API_KEY = None
-elif MODEL_RUNTIME == "gemini":
-    LLM_PROVIDER = "gemini"
-    LLM_MODEL = "gemini-2.0-flash"
-    LLM_ENDPOINT = None
-    LLM_API_KEY = "AIzaSyCjesXGbLVTL--_jJCQmaGxWf4N-eWUvAQ"
-    if not LLM_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable must be set for gemini provider")
+# Global metrics and processed_ids to persist across invoke calls
+global_metrics = {
+    "runs": [],
+    "service_start_time": datetime.now(UTC).isoformat(),
+    "total_logs_processed": 0,
+    "total_errors": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "last_run_status": "running"
+}
+global_processed_ids = set()
 
-logger.info("Selected model runtime: %s (provider=%s, model=%s, endpoint=%s)",
-            MODEL_RUNTIME, LLM_PROVIDER, LLM_MODEL, LLM_ENDPOINT or "default")
+class AgentState(TypedDict):
+    log_data: Optional[Dict]
+    rca_result: Optional[Dict]
+    publish_result: Optional[str]
+    metrics: Dict
+    processed_ids: set
+    model_status: str
+    current_log_message: Optional[str]
+    validation_passed: bool
 
-# Kafka setup with manual offset control
+def initialize_state():
+    return AgentState(
+        log_data=None,
+        rca_result=None,
+        publish_result=None,
+        metrics=global_metrics,  # Reference global metrics
+        processed_ids=global_processed_ids,  # Reference global processed_ids
+        model_status="idle",
+        current_log_message=None,
+        validation_passed=False
+    )
+
+# Kafka setup
 kafka_config = {"bootstrap.servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")}
 logger.info("Kafka configuration: %s", kafka_config)
 
@@ -44,10 +64,10 @@ consumer = Consumer({
     **kafka_config,
     "group.id": "rca_group",
     "auto.offset.reset": "earliest",
-    "enable.auto.commit": False,  # Manual offset control
-    "max.poll.interval.ms": "1800000",  # 30 minutes for LLM processing
-    "session.timeout.ms": "300000",     # 5 minutes
-    "heartbeat.interval.ms": "10000",   # 10 seconds
+    "enable.auto.commit": False,
+    "max.poll.interval.ms": "1800000",
+    "session.timeout.ms": "300000",
+    "heartbeat.interval.ms": "10000",
     "fetch.min.bytes": 1,
     "fetch.wait.max.ms": 500
 })
@@ -56,155 +76,299 @@ logger.info("Kafka consumer subscribed to: logs.anomalies with manual offset con
 
 producer = Producer({
     **kafka_config,
-    "acks": "all",  # Wait for all replicas to acknowledge
+    "acks": "all",
     "retries": 3,
     "delivery.timeout.ms": 30000
 })
 logger.info("Kafka producer initialized with reliable delivery settings")
 
 # LLM setup
-llm_interface = LLMInterface(
-    provider=LLM_PROVIDER,
-    model=LLM_MODEL,
-    endpoint=LLM_ENDPOINT,
-    api_key=LLM_API_KEY
-)
+llm_interface = LLMInterface()
 logger.info("LLM initialized: provider=%s, model=%s, endpoint=%s",
-            LLM_PROVIDER, LLM_MODEL, LLM_ENDPOINT or "default")
+            llm_interface.provider, llm_interface.model, llm_interface.endpoint or "default")
 
-llm = llm_interface.llm
-logger.info("LLM object created for provider: %s", LLM_PROVIDER)
+# FastAPI app
+app = FastAPI()
 
-# Enhanced tools with better error handling
-def publish_to_kafka_rca(data: str) -> str:
-    """Publish RCA results to Kafka with delivery confirmation"""
-    if not data or not data.strip():
-        logger.error("No RCA data provided for publishing.")
-        return "ERROR: No RCA data provided"
-    
-    logger.debug("Publishing RCA to logs.rca.output: %s", data[:200] + "..." if len(data) > 200 else data)
+def save_metrics():
+    try:
+        # Limit to last 1000 runs to manage memory
+        global_metrics["runs"] = global_metrics["runs"][-1000:]
+        with open(metrics_file, 'w') as f:
+            json.dump(global_metrics, f, indent=2)
+        logger.debug("Metrics saved to %s", metrics_file)
+    except Exception as e:
+        logger.error("Failed to save metrics: %s", str(e))
+
+@app.get("/health")
+async def health_check():
+    try:
+        kafka_ok = producer.list_topics(timeout=5) is not None
+        llm_ok = llm_interface.llm is not None
+        status = "healthy" if kafka_ok and llm_ok else "unhealthy"
+        
+        recent_runs = global_metrics["runs"][-10:]
+        error_runs = [r for r in recent_runs if r.get("status") == "error"]
+        rca_runs = [r for r in recent_runs if r.get("function") == "perform_rca"]
+        publish_runs = [r for r in recent_runs if r.get("function") == "publish_to_kafka_rca"]
+        
+        total_logs = global_metrics["total_logs_processed"]
+        avg_tokens_per_log = {
+            "input": global_metrics["total_input_tokens"] / total_logs if total_logs > 0 else 0,
+            "output": global_metrics["total_output_tokens"] / total_logs if total_logs > 0 else 0
+        }
+        
+        valid_rca_runs = [r for r in rca_runs if "total_duration_ms" in r]
+        valid_publish_runs = [r for r in publish_runs if "total_duration_ms" in r]
+        
+        if not valid_rca_runs and rca_runs:
+            logger.warning("Some RCA runs missing total_duration_ms: %s", [r["run_id"] for r in rca_runs if "total_duration_ms" not in r])
+        if not valid_publish_runs and publish_runs:
+            logger.warning("Some publish runs missing total_duration_ms: %s", [r["run_id"] for r in publish_runs if "total_duration_ms" not in r])
+        
+        avg_durations = {
+            "perform_rca": {
+                "total": mean([r["total_duration_ms"] for r in valid_rca_runs]) if valid_rca_runs else 0,
+                "steps": {
+                    step: mean([r["steps"][step]["duration_ms"] for r in rca_runs if step in r["steps"]])
+                    for step in ["llm_call", "clean_response"]
+                    if any(step in r["steps"] for r in rca_runs)
+                }
+            },
+            "publish_to_kafka_rca": {
+                "total": mean([r["total_duration_ms"] for r in valid_publish_runs]) if valid_publish_runs else 0,
+                "steps": {
+                    step: mean([r["steps"][step]["duration_ms"] for r in publish_runs if step in r["steps"]])
+                    for step in ["validate_json", "kafka_produce"]
+                    if any(step in r["steps"] for r in publish_runs)
+                }
+            }
+        }
+        
+        error_rate = len(error_runs) / len(global_metrics["runs"]) if global_metrics["runs"] else 0
+
+        return {
+            "status": status,
+            "kafka": "connected" if kafka_ok else "disconnected",
+            "llm": "initialized" if llm_ok else "uninitialized",
+            "model_status": initialize_state()["model_status"],  # Use current model_status
+            "current_log_message": initialize_state()["current_log_message"],
+            "metrics": {
+                "total_logs_processed": total_logs,
+                "total_errors": global_metrics["total_errors"],
+                "error_rate": error_rate,
+                "total_input_tokens": global_metrics["total_input_tokens"],
+                "total_output_tokens": global_metrics["total_output_tokens"],
+                "avg_tokens_per_log": avg_tokens_per_log,
+                "service_uptime_hours": (datetime.now(UTC) - datetime.fromisoformat(global_metrics["service_start_time"].replace('Z', '+00:00'))).total_seconds() / 3600,
+                "last_run": {
+                    "status": global_metrics["last_run_status"],
+                    "timestamp": global_metrics["runs"][-1]["timestamp"] if global_metrics["runs"] else None,
+                    "function": global_metrics["runs"][-1]["function"] if global_metrics["runs"] else None,
+                    "total_duration_ms": global_metrics["runs"][-1].get("total_duration_ms", None) if global_metrics["runs"] else None
+                },
+                "recent_runs": [
+                    {
+                        "run_id": r["run_id"],
+                        "timestamp": r["timestamp"],
+                        "function": r["function"],
+                        "status": r["status"],
+                        "total_duration_ms": r.get("total_duration_ms", None),
+                        "steps": r["steps"],
+                        "log_id": r.get("log_id", None),
+                        "input_tokens": r.get("input_tokens", 0),
+                        "output_tokens": r.get("output_tokens", 0),
+                        "error": r.get("error", None)
+                    } for r in recent_runs
+                ],
+                "average_durations": avg_durations
+            }
+        }
+    except Exception as e:
+        logger.error("Health endpoint error: %s", str(e))
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "model_status": initialize_state()["model_status"],
+            "current_log_message": initialize_state()["current_log_message"],
+            "metrics": {
+                "total_logs_processed": global_metrics["total_logs_processed"],
+                "total_errors": global_metrics["total_errors"],
+                "error_rate": error_rate,
+                "total_input_tokens": global_metrics["total_input_tokens"],
+                "total_output_tokens": global_metrics["total_output_tokens"]
+            }
+        }
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
+
+def run_api():
+    uvicorn.run(app, host="0.0.0.0", port=8001, log_level="info")
+
+def consume_kafka(state: AgentState) -> AgentState:
+    metrics_entry = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "function": "consume_kafka",
+        "steps": {}
+    }
+    start_time = time.time()
     
     try:
-        # Validate JSON and required fields
-        parsed = json.loads(data)
-        required_fields = ["log_id", "rca", "recommended_actions", "severity"]
-        missing_fields = [field for field in required_fields if field not in parsed]
-        if missing_fields:
-            logger.error("Missing required fields in RCA JSON: %s", missing_fields)
-            return f"ERROR: Missing required fields - {', '.join(missing_fields)}"
+        msg = consumer.poll(timeout=5.0)
+        if msg is None:
+            logger.debug("No new messages in logs.anomalies")
+            metrics_entry["status"] = "skipped"
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["validation_passed"] = False  # Ensure no loop back
+            return state
         
-        def delivery_callback(err, msg):
-            if err:
-                logger.error("Failed to deliver RCA message: %s", err)
-            else:
-                logger.info("RCA message delivered to partition %d at offset %d", 
-                           msg.partition(), msg.offset())
+        if msg.error():
+            logger.error("Kafka consumer error: %s", msg.error())
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(msg.error())
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["total_errors"] += 1
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["validation_passed"] = False
+            return state
         
-        producer.produce(
-            "logs.rca.output", 
-            value=data.encode("utf-8"),
-            callback=delivery_callback
-        )
-        producer.flush(timeout=10.0)  # Wait up to 10 seconds for delivery
-        logger.info("Successfully published RCA to logs.rca.output")
-        return "SUCCESS: Published RCA to Kafka"
-        
-    except json.JSONDecodeError as e:
-        logger.error("Invalid JSON in RCA data: %s", str(e))
-        return f"ERROR: Invalid JSON format - {str(e)}"
-    except KafkaError as e:
-        logger.error("Kafka error publishing RCA: %s", str(e))
-        return f"ERROR: Kafka publishing failed - {str(e)}"
+        state["log_data"] = {"message": msg, "offset": msg.offset(), "partition": msg.partition(), "topic": msg.topic()}
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        return state
     except Exception as e:
-        logger.error("Unexpected error publishing RCA: %s", str(e))
-        return f"ERROR: Unexpected error - {str(e)}"
+        logger.error("Error in consume_kafka: %s", str(e))
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["total_errors"] += 1
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["validation_passed"] = False
+        return state
 
-tools = [
-    Tool(
-        name="PublishRCAResults",
-        func=publish_to_kafka_rca,
-        description="Publish completed RCA analysis as JSON to the logs.rca.output Kafka topic. Input must be valid JSON containing log_id, rca, recommended_actions, and severity fields."
-    )
-]
-logger.info("Enhanced tools initialized: %s", [tool.name for tool in tools])
-
-# Simplified prompt template to avoid variable issues
-system_prompt = """You are an RCA Publishing Agent. Your only job is to publish RCA analysis results to Kafka using the provided tool.
-
-INSTRUCTIONS:
-- Use ONLY the PublishRCAResults tool to publish the RCA JSON.
-- Validate that the input is valid JSON with required fields (log_id, rca, recommended_actions, severity).
-- If publishing fails, report the error clearly and do NOT retry.
-- If publishing succeeds, confirm success clearly.
-
-Available Tool:
-- PublishRCAResults: Publishes RCA JSON to logs.rca.output topic.
-
-RESPONSE FORMAT:
-Thought: [Your reasoning about the RCA data and publishing plan]
-Action: PublishRCAResults
-Action Input: {input}
-Observation: [Tool response]
-Thought: [Interpret the tool response]
-Final Answer: SUCCESS: Published RCA to Kafka
-
-EXAMPLE:
-Thought: Ready to publish RCA JSON.
-Action: PublishRCAResults
-Action Input: {{"log_id": "123", "rca": {{"summary": "Example"}}, "recommended_actions": ["Action"], "severity": "LOW"}}
-Observation: SUCCESS: Published RCA to Kafka
-Thought: Publishing succeeded.
-Final Answer: SUCCESS: Published RCA to Kafka
-
-TOOLS: {tools}
-TOOL_NAMES: {tool_names}
-"""
-
-human_prompt = """Publish this RCA analysis to Kafka:
-
-{input}
-
-Ensure the data is published successfully to the logs.rca.output topic.
-{agent_scratchpad}"""
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", system_prompt),
-    ("human", human_prompt)
-])
-logger.info("Simplified prompt template initialized")
-
-# Create LangChain agent
-agent = create_react_agent(llm, tools, prompt)
-executor = AgentExecutor(
-    agent=agent, 
-    tools=tools, 
-    verbose=True, 
-    handle_parsing_errors=True,
-    max_iterations=1,  # Avoid retrying invalid JSON
-    early_stopping_method="generate"
-)
-logger.info("LangChain agent and executor initialized with enhanced error handling")
-
-def perform_rca(log_data: dict) -> dict:
-    """Perform comprehensive RCA using direct LLM call with enhanced prompting"""
-    message = log_data.get("log_message", "")
-    log_id = log_data.get("_id", "unknown")
-    timestamp = log_data.get("timestamp", "unknown")
-    log_type = log_data.get("type", "unknown")
-    level = log_data.get("log_level", "unknown")
-    java_class = log_data.get("java_class", "")
-    thread = log_data.get("thread", "")
-    summary = log_data.get("summary", "")
-    stack_trace = log_data.get("stack_trace", "")
-    component = log_data.get("component", "")
-
-    # Check if this log_id was already processed
-    if log_id in perform_rca.processed_ids:
-        logger.info(f"Log_id {log_id} already processed, skipping analysis.")
-        return None
-    perform_rca.processed_ids.add(log_id)
+def validate_input(state: AgentState) -> AgentState:
+    metrics_entry = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "function": "validate_input",
+        "steps": {}
+    }
+    start_time = time.time()
     
-    system_prompt = f"""You are an expert Root Cause Analysis (RCA) specialist with extensive experience in system analysis.
+    try:
+        if not state["log_data"] or not state["log_data"].get("message"):
+            logger.error("No log data to validate")
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = "No log data"
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["validation_passed"] = False
+            return state
+        
+        msg = state["log_data"]["message"]
+        log = msg.value().decode("utf-8")
+        log_data = json.loads(log)
+        
+        required_fields = ["_id", "log_message"]
+        missing_fields = [f for f in required_fields if f not in log_data]
+        if missing_fields:
+            logger.error("Missing required fields in log: %s", missing_fields)
+            commit_message_offset(state)
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = f"Missing fields: {missing_fields}"
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["log_data"] = None
+            state["validation_passed"] = False
+            return state
+        
+        log_id = log_data["_id"]
+        if log_id in state["processed_ids"]:
+            logger.info(f"Log_id {log_id} already processed, skipping")
+            commit_message_offset(state)
+            metrics_entry["status"] = "skipped"
+            metrics_entry["log_id"] = log_id
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["log_data"] = None
+            state["validation_passed"] = False
+            return state
+        
+        state["log_data"]["parsed"] = log_data
+        state["current_log_message"] = log_data.get("log_message", "")
+        state["validation_passed"] = True
+        metrics_entry["status"] = "success"
+        metrics_entry["log_id"] = log_id
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        return state
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in consumed message: %s", str(e))
+        commit_message_offset(state)
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = f"Invalid JSON: {str(e)}"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["total_errors"] += 1
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["log_data"] = None
+        state["validation_passed"] = False
+        return state
+    except Exception as e:
+        logger.error("Error in validate_input: %s", str(e))
+        commit_message_offset(state)
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["total_errors"] += 1
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["log_data"] = None
+        state["validation_passed"] = False
+        return state
+
+def perform_rca(state: AgentState) -> AgentState:
+    start_time = time.time()
+    metrics_entry = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "function": "perform_rca",
+        "steps": {},
+        "input_tokens": 0,
+        "output_tokens": 0
+    }
+    state["model_status"] = "analyzing"
+    
+    try:
+        log_data = state["log_data"]["parsed"]
+        message = log_data.get("log_message", "")
+        log_id = log_data.get("_id", "unknown")
+        timestamp = log_data.get("timestamp", "unknown")
+        log_type = log_data.get("type", "unknown")
+        level = log_data.get("log_level", "unknown")
+        java_class = log_data.get("java_class", "")
+        thread = log_data.get("thread", "")
+        summary = log_data.get("summary", "")
+        stack_trace = log_data.get("stack_trace", "")
+        component = log_data.get("component", "")
+        
+        state["processed_ids"].add(log_id)
+        state["metrics"]["total_logs_processed"] += 1
+        
+        system_prompt = f"""You are an expert Root Cause Analysis (RCA) specialist with extensive experience in system analysis.
 
 ANALYSIS CONTEXT:
 - Log ID: {log_id}
@@ -267,8 +431,8 @@ OUTPUT FORMAT (JSON ONLY):
         "log_level": "{level}"
     }}
 }}"""
-    
-    user_prompt = f"""Analyze this log message and provide comprehensive root cause analysis:
+        
+        user_prompt = f"""Analyze this log message and provide comprehensive root cause analysis:
 
 LOG MESSAGE: {message}
 
@@ -282,68 +446,52 @@ Additional context from log entry:
 - Component: {component}
 
 Perform thorough technical analysis, provide actionable recommendations, and return the JSON response."""
-    
-    try:
-        logger.info("Starting RCA analysis for log_id: %s (type: %s)", log_id, log_type)
-        analysis = llm_interface.call(system_prompt, user_prompt, timeout=30)
         
-        # Clean up and parse response
+        logger.info("Starting RCA analysis for log_id: %s (type: %s)", log_id, log_type)
+        
+        llm_start = time.time()
+        analysis, token_counts = llm_interface.call(system_prompt, user_prompt, timeout=30)
+        metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.time() - llm_start) * 1000}
+        metrics_entry["input_tokens"] = token_counts.get("input_tokens", 0)
+        metrics_entry["output_tokens"] = token_counts.get("output_tokens", 0)
+        state["metrics"]["total_input_tokens"] += token_counts.get("input_tokens", 0)
+        state["metrics"]["total_output_tokens"] += token_counts.get("output_tokens", 0)
+        
+        clean_start = time.time()
         analysis = clean_llm_response(analysis)
         parsed = json.loads(analysis)
+        metrics_entry["steps"]["clean_response"] = {"duration_ms": (time.time() - clean_start) * 1000}
         
-        # Ensure RCA is a proper JSON object, not a string
         if isinstance(parsed.get("rca"), str):
             try:
                 parsed["rca"] = json.loads(parsed["rca"].replace("'", '"'))
             except json.JSONDecodeError:
                 logger.warning("Could not parse RCA string as JSON, leaving as is")
         
-        # Add timestamp and log_type if missing
         if "analysis_timestamp" not in parsed.get("metadata", {}):
             parsed["metadata"] = parsed.get("metadata", {})
             parsed["metadata"]["analysis_timestamp"] = timestamp
         if "log_type" not in parsed.get("metadata", {}):
             parsed["metadata"]["log_type"] = log_type
             
-        # Ensure recommended_actions is present
         if "recommended_actions" not in parsed:
             logger.warning("LLM did not provide recommended_actions, adding default")
             parsed["recommended_actions"] = ["Review and update instrument database", "Validate client request parameters"]
             
-        return parsed
+        state["rca_result"] = parsed
+        metrics_entry["status"] = "success"
+        metrics_entry["log_id"] = log_id
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["model_status"] = "idle"
+        state["current_log_message"] = None
+        return state
         
-    except LangChainException as e:
-        logger.error("LLM call timed out or failed for log_id %s: %s", log_id, str(e))
-        return {
-            "log_id": str(log_id),
-            "rca": {
-                "summary": f"RCA analysis failed: {str(e)}",
-                "detailed_analysis": "Analysis timed out or failed",
-                "root_causes": [],
-                "system_state": {
-                    "affected_components": [],
-                    "error_patterns": [],
-                    "environmental_factors": []
-                },
-                "java_class": java_class,
-                "thread": thread,
-                "log_summary": summary,
-                "stack_trace": stack_trace,
-                "component": component
-            },
-            "recommended_actions": ["Investigate LLM server timeout"],
-            "severity": "LOW",
-            "confidence": "LOW",
-            "category": "OTHER",
-            "metadata": {
-                "analysis_timestamp": timestamp,
-                "log_type": log_type,
-                "log_level": level
-            }
-        }
     except Exception as e:
         logger.error("RCA analysis failed for log_id %s: %s", log_id, str(e))
-        return {
+        # Estimate token counts for error response
+        error_response = json.dumps({
             "log_id": str(log_id),
             "rca": {
                 "summary": f"RCA analysis failed: {str(e)}",
@@ -360,7 +508,7 @@ Perform thorough technical analysis, provide actionable recommendations, and ret
                 "stack_trace": stack_trace,
                 "component": component
             },
-            "recommended_actions": ["Review system logs for errors"],
+            "recommended_actions": ["Review LLM configuration"],
             "severity": "LOW",
             "confidence": "LOW",
             "category": "OTHER",
@@ -369,174 +517,214 @@ Perform thorough technical analysis, provide actionable recommendations, and ret
                 "log_type": log_type,
                 "log_level": level
             }
+        })
+        token_counts = {
+            "input_tokens": llm_interface._estimate_tokens(system_prompt + user_prompt),
+            "output_tokens": llm_interface._estimate_tokens(error_response)
         }
+        state["rca_result"] = json.loads(error_response)
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["input_tokens"] = token_counts["input_tokens"]
+        metrics_entry["output_tokens"] = token_counts["output_tokens"]
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["total_errors"] += 1
+        state["metrics"]["total_input_tokens"] += token_counts["input_tokens"]
+        state["metrics"]["total_output_tokens"] += token_counts["output_tokens"]
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["model_status"] = "idle"
+        state["current_log_message"] = None
+        return state
 
-# Add static set to track processed IDs
-perform_rca.processed_ids = set()
-
-def clean_llm_response(response: str) -> str:
-    """Clean and standardize LLM response"""
-    # Remove code block markers
-    response = re.sub(r'```json\s*', '', response)
-    response = re.sub(r'```\s*$', '', response)
+def publish_to_kafka_rca(state: AgentState) -> AgentState:
+    start_time = time.time()
+    metrics_entry = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "function": "publish_to_kafka_rca",
+        "steps": {}
+    }
     
-    # Remove any HTML-like tags
-    response = re.sub(r'<[^>]+>.*?</[^>]+>', '', response, flags=re.DOTALL)
-    
-    # Extract JSON object if embedded in text
-    json_match = re.search(r'\{.*\}', response, re.DOTALL)
-    if json_match:
-        response = json_match.group(0)
-    
-    return response.strip()
-
-def commit_message_offset(msg):
-    """Commit offset for a specific message immediately"""
     try:
-        # Commit the specific message offset
+        if not state["rca_result"]:
+            logger.error("No RCA result to publish")
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = "No RCA result"
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["publish_result"] = "ERROR: No RCA result"
+            return state
+        
+        data = json.dumps(state["rca_result"], indent=2)
+        logger.debug("Publishing RCA to logs.rca.output: %s", data[:200] + "..." if len(data) > 200 else data)
+        
+        validate_start = time.time()
+        parsed = json.loads(data)
+        required_fields = ["log_id", "rca", "recommended_actions", "severity"]
+        missing_fields = [field for field in required_fields if field not in parsed]
+        if missing_fields:
+            logger.error("Missing required fields in RCA JSON: %s", missing_fields)
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = f"Missing required fields - {', '.join(missing_fields)}"
+            metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+            state["metrics"]["runs"].append(metrics_entry)
+            save_metrics()
+            state["publish_result"] = f"ERROR: Missing required fields - {', '.join(missing_fields)}"
+            return state
+        metrics_entry["steps"]["validate_json"] = {"duration_ms": (time.time() - validate_start) * 1000}
+        
+        produce_start = time.time()
+        def delivery_callback(err, msg):
+            if err:
+                logger.error("Failed to deliver RCA message: %s", err)
+            else:
+                logger.info("RCA message delivered to partition %d at offset %d", 
+                           msg.partition(), msg.offset())
+        
+        producer.produce(
+            "logs.rca.output", 
+            value=data.encode("utf-8"),
+            callback=delivery_callback
+        )
+        producer.flush(timeout=10.0)
+        metrics_entry["steps"]["kafka_produce"] = {"duration_ms": (time.time() - produce_start) * 1000}
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["publish_result"] = "SUCCESS: Published RCA to Kafka"
+        return state
+        
+    except json.JSONDecodeError as e:
+        logger.error("Invalid JSON in RCA data: %s", str(e))
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = f"Invalid JSON format - {str(e)}"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["publish_result"] = f"ERROR: Invalid JSON format - {str(e)}"
+        return state
+    except KafkaError as e:
+        logger.error("Kafka error publishing RCA: %s", str(e))
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = f"Kafka publishing failed - {str(e)}"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["publish_result"] = f"ERROR: Kafka publishing failed - {str(e)}"
+        return state
+    except Exception as e:
+        logger.error("Unexpected error publishing RCA: %s", str(e))
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = f"Unexpected error - {str(e)}"
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["publish_result"] = f"ERROR: Unexpected error - {str(e)}"
+        return state
+
+def commit_message_offset(state: AgentState) -> AgentState:
+    start_time = time.time()
+    metrics_entry = {
+        "run_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(UTC).isoformat(),
+        "function": "commit_message_offset",
+        "steps": {}
+    }
+    
+    try:
+        msg = state["log_data"]["message"]
+        commit_start = time.time()
         partitions = [TopicPartition(msg.topic(), msg.partition(), msg.offset() + 1)]
         consumer.commit(offsets=partitions, asynchronous=False)
         logger.info("Committed offset %d for partition %d of topic %s", 
                    msg.offset() + 1, msg.partition(), msg.topic())
-        return True
+        metrics_entry["status"] = "success"
+        metrics_entry["steps"]["commit"] = {"duration_ms": (time.time() - commit_start) * 1000}
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["log_data"] = None
+        state["validation_passed"] = False
+        return state
     except Exception as e:
         logger.error("Failed to commit offset for message: %s", str(e))
-        return False
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.time() - start_time) * 1000
+        state["metrics"]["total_errors"] += 1
+        state["metrics"]["runs"].append(metrics_entry)
+        save_metrics()
+        state["log_data"] = None
+        state["validation_passed"] = False
+        return state
 
-# Enhanced main loop with reliable message processing
+def clean_llm_response(response: str) -> str:
+    response = re.sub(r'```json\s*', '', response)
+    response = re.sub(r'```\s*$', '', response)
+    response = re.sub(r'<[^>]+>.*?</[^>]+>', '', response, flags=re.DOTALL)
+    json_match = re.search(r'\{.*\}', response, re.DOTALL)
+    if json_match:
+        response = json_match.group(0)
+    return response.strip()
+
+# LangGraph setup
+kafka_subgraph = StateGraph(AgentState)
+kafka_subgraph.add_node("consume_kafka", consume_kafka)
+kafka_subgraph.add_node("validate_input", validate_input)
+kafka_subgraph.add_edge(START, "consume_kafka")
+kafka_subgraph.add_edge("consume_kafka", "validate_input")
+kafka_subgraph.add_conditional_edges(
+    "validate_input",
+    lambda state: END if state["validation_passed"] or state["log_data"] is None else "consume_kafka"
+)
+kafka_subgraph.set_entry_point("consume_kafka")
+
+workflow = StateGraph(AgentState)
+workflow.add_node("kafka_subgraph", kafka_subgraph.compile())
+workflow.add_node("perform_rca", perform_rca)
+workflow.add_node("publish_to_kafka_rca", publish_to_kafka_rca)
+workflow.add_node("commit_message_offset", commit_message_offset)
+workflow.add_conditional_edges(
+    "kafka_subgraph",
+    lambda state: "perform_rca" if state["validation_passed"] else END
+)
+workflow.add_edge("perform_rca", "publish_to_kafka_rca")
+workflow.add_conditional_edges(
+    "publish_to_kafka_rca",
+    lambda state: "commit_message_offset" if state["publish_result"] and "SUCCESS" in state["publish_result"] else END
+)
+workflow.add_edge("commit_message_offset", END)
+workflow.set_entry_point("kafka_subgraph")
+
+graph = workflow.compile()
+
 def main():
-    """Main loop for RCA Agent: consumes logs, performs RCA, and publishes results reliably."""
-    logger.info("Starting enhanced RCA Agent with reliable message processing")
-    processing_msg = None
-    last_processed_offset = {}
-    processed_log_ids = set()  # Track processed log IDs across the main loop
-
-    while True:
-        try:
-            # Only poll for new messages if not currently processing one
-            if processing_msg is None:
-                msg = consumer.poll(timeout=5.0)
-
-                if msg is None:
-                    logger.debug("No new messages in logs.anomalies (topic: %s, partitions: %s)",
-                                 "logs.anomalies", consumer.assignment())
-                    continue
-
-                if msg.error():
-                    logger.error("Kafka consumer error: %s", msg.error())
-                    continue
-
-                # Deduplication: skip if this offset was already processed
-                topic = msg.topic()
-                partition = msg.partition()
-                offset = msg.offset()
-                if last_processed_offset.get((topic, partition)) == offset:
-                    logger.debug("Skipping duplicate message at offset %d partition %d", offset, partition)
-                    continue
-
-                # Parse input log to check log_id before processing
-                try:
-                    log = msg.value().decode("utf-8")
-                    log_data = json.loads(log)
-                    log_id = log_data.get("_id", "unknown")
-                    if log_id in processed_log_ids:
-                        logger.info(f"Log_id {log_id} already processed in this session, committing offset and skipping.")
-                        commit_message_offset(msg)
-                        continue
-                except Exception as e:
-                    logger.error(f"Error parsing message for log_id deduplication: {e}")
-                    commit_message_offset(msg)
-                    continue
-
-                # Start processing this message
-                processing_msg = msg
-                logger.info("Started processing message at offset %d from partition %d", offset, partition)
-
-            # Pause consumer to prevent new message fetching during processing
-            consumer.pause([TopicPartition(processing_msg.topic(), processing_msg.partition())])
-
-            try:
-                # Parse input log
-                log = processing_msg.value().decode("utf-8")
-                log_data = json.loads(log)
-                logger.info("Processing log from logs.anomalies: %s",
-                            log[:200] + "..." if len(log) > 200 else log)
-
-                # Perform RCA analysis
-                logger.info("Starting RCA analysis...")
-                rca_result = perform_rca(log_data)
-                if rca_result is None:
-                    logger.info("Skipping already processed log_id, committing offset.")
-                    commit_message_offset(processing_msg)
-                    processing_msg = None
-                    continue
-
-                # Track processed log_id in the main loop as well
-                processed_log_ids.add(log_data.get("_id", "unknown"))
-
-                rca_json = json.dumps(rca_result, indent=2)
-                logger.debug("RCA analysis completed: %s", rca_json[:300] + "..." if len(rca_json) > 300 else rca_json)
-
-                # Use agent to publish results
-                logger.info("Publishing RCA results via agent...")
-                logger.debug("Agent input: %s", {"input": rca_json[:200] + "..." if len(rca_json) > 200 else rca_json})
-                result = executor.invoke({"input": rca_json})
-
-                # Check if publishing was successful
-                agent_output = result.get("output", "")
-                logger.info("Agent execution result: %s", agent_output)
-
-                if "SUCCESS" in agent_output and "Published RCA to Kafka" in agent_output:
-                    # Commit offset immediately after successful processing
-                    if commit_message_offset(processing_msg):
-                        logger.info("✅ Message processed successfully and offset committed")
-                        # Mark this offset as processed
-                        last_processed_offset[(processing_msg.topic(), processing_msg.partition())] = processing_msg.offset()
-                        processing_msg = None  # Ready for next message
-                    else:
-                        logger.error("❌ Processing succeeded but offset commit failed - will retry")
-                        # Keep processing_msg to retry commit
-                else:
-                    logger.error("❌ Publishing failed: %s", agent_output)
-                    logger.info("Will retry processing this message...")
-                    # Reset processing_msg to force retry
-                    processing_msg = None
-
-            except json.JSONDecodeError as e:
-                logger.error("Invalid JSON in consumed message: %s", str(e))
-                # Skip this message and commit offset to avoid infinite loop
-                commit_message_offset(processing_msg)
-                processing_msg = None
-
-            except Exception as e:
-                logger.error("Error processing message: %s", str(e))
-                logger.info("Will retry processing this message...")
-                processing_msg = None
-
-            finally:
-                # Always resume consumer
-                try:
-                    consumer.resume([TopicPartition(processing_msg.topic() if processing_msg else "logs.anomalies",
-                                                   processing_msg.partition() if processing_msg else 0)])
-                except Exception as e:
-                    logger.error("Error resuming consumer: %s", str(e))
-
-        except KeyboardInterrupt:
-            logger.info("Received shutdown signal")
-            break
-
-        except Exception as e:
-            logger.error("Unexpected error in main loop: %s", str(e))
-            # Reset processing state on unexpected errors
-            processing_msg = None
-
-    # Cleanup
-    logger.info("Shutting down RCA Agent...")
+    logger.info("Starting LangGraph RCA Agent")
+    api_thread = Thread(target=run_api, daemon=True)
+    api_thread.start()
+    
     try:
-        consumer.close()
-        producer.flush()
-    except Exception as e:
-        logger.error("Error during shutdown: %s", str(e))
+        while True:
+            state = initialize_state()
+            graph.invoke(state, config={"recursion_limit": 1000})  # Increased recursion limit
+            global_metrics["last_run_status"] = "running"
+            save_metrics()
+            if state["log_data"] is None and not state["validation_passed"]:
+                time.sleep(1)  # Brief pause when no messages to avoid tight loop
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+        global_metrics["last_run_status"] = "stopped"
+        save_metrics()
+    finally:
+        logger.info("Shutting down RCA Agent...")
+        try:
+            consumer.close()
+            producer.flush()
+        except Exception as e:
+            logger.error("Error during shutdown: %s", str(e))
 
 if __name__ == "__main__":
     main()

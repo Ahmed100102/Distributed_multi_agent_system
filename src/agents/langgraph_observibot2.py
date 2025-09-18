@@ -9,13 +9,16 @@ from typing import TypedDict, List, Optional, Dict, Any
 import time
 import asyncio
 from collections import defaultdict
+import threading
+import concurrent.futures
+from queue import Queue
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from elasticsearch import Elasticsearch
+from elasticsearch import AsyncElasticsearch
 from langchain.tools import Tool
 from langchain.prompts import PromptTemplate as LCPromptTemplate
 from langchain_community.chat_message_histories import ChatMessageHistory
@@ -24,8 +27,8 @@ from langchain.chains.summarize import load_summarize_chain
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 import tiktoken
-
-from src.agents.llm_interface import LLMInterface
+from contextlib import asynccontextmanager
+from src.agents.llm_interface import LLMInterface, runtime_configs
 
 # Logger Setup
 logging.basicConfig(
@@ -34,6 +37,52 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger("Observibot")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup logic (if any)
+    logger.info("Starting up Observibot...")
+    yield  # This is where the application runs
+    # Shutdown logic
+    logger.info("Shutting down Observibot...")
+    try:
+        await es.close()
+        logger.info("Elasticsearch connection closed.")
+    except Exception as e:
+        logger.error(f"Error closing Elasticsearch connection: {str(e)}")
+    with metrics_lock:
+        global_metrics["runs"].append({
+            "run_id": str(uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "function": "shutdown",
+            "status": "success",
+            "total_duration_ms": 0
+        })
+        save_metrics()
+    logger.info("Shutdown complete.")
+    
+# Global Metrics
+global_metrics = {
+    "total_queries_processed": 0,
+    "total_errors": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "runs": [],
+    "start_time": time.time(),
+    "node_counts": defaultdict(int),
+    "node_durations": defaultdict(float),
+    "node_errors": defaultdict(int)
+}
+metrics_lock = threading.Lock()
+
+def save_metrics():
+    try:
+        with metrics_lock:
+            with open("observibot_metrics.json", "w") as f:
+                json.dump(global_metrics, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save metrics: {str(e)}")
 
 def log_and_truncate_response(response: Any, max_length: int = 800) -> None:
     msg = json.dumps(response, indent=2) if isinstance(response, (dict, list)) else str(response)
@@ -53,7 +102,8 @@ def clean_llm_response(text: Any) -> str:
 app = FastAPI(
     title="Observibot",
     description="LLM agent system for Observix platform using LangGraph.",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 app.add_middleware(
     CORSMiddleware,
@@ -75,7 +125,7 @@ class TraceRequest(BaseModel):
 # Elasticsearch Connection
 ES_URL = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
 INDEX = os.getenv("ELASTICSEARCH_INDEX", "observix-results-*")
-es = Elasticsearch(
+es = AsyncElasticsearch(
     ES_URL,
     verify_certs=os.getenv("ELASTICSEARCH_VERIFY_CERTS", "true").lower() == "true",
     retry_on_timeout=True,
@@ -83,65 +133,19 @@ es = Elasticsearch(
     request_timeout=30
 )
 
-# LLM Setup
-MODEL_RUNTIME = os.getenv("MODEL_RUNTIME", "gemini").lower()
-VALID_RUNTIMES = ["llama_cpp", "gemini", "groq", "ollama"]
-runtime_configs = {
-    "llama_cpp": {
-        "provider": "llama_cpp",
-        "model": os.getenv("LLM_MODEL_REMEDIATION", "qwen3:4b"),
-        "endpoint": os.getenv("LLM_ENDPOINT", "http://localhost:18000"),
-        "api_key": None
-    },
-    "gemini": {
-        "provider": "gemini",
-        "model": os.getenv("LLM_MODEL_REMEDIATION", "gemini-2.5-flash"),
-        "endpoint": None,
-        "api_key": os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-    },
-    "groq": {
-        "provider": "groq",
-        "model": os.getenv("LLM_MODEL_REMEDIATION", "meta-llama/llama-4-scout-17b-16e-instruct"),
-        "endpoint": None,
-        "api_key": os.getenv("GROQ_API_KEY")
-    },
-    "ollama": {
-        "provider": "ollama",
-        "model": os.getenv("LLM_MODEL_REMEDIATION", "llama3.2:3b"),
-        "endpoint": os.getenv("LLM_ENDPOINT", "http://localhost:11434"),
-        "api_key": None
-    }
-}
-if MODEL_RUNTIME not in VALID_RUNTIMES:
-    raise ValueError(f"Invalid MODEL_RUNTIME: {MODEL_RUNTIME}. Must be one of {VALID_RUNTIMES}")
-config = runtime_configs[MODEL_RUNTIME]
-llm_interface = LLMInterface(
-    provider=config["provider"],
-    model=config["model"],
-    endpoint=config["endpoint"],
-    api_key=config["api_key"]
-)
-llm = llm_interface.llm
+# LLM Configuration
+config = runtime_configs.get(os.getenv("MODEL_RUNTIME", "gemini").lower(), runtime_configs["gemini"])
+llm_interface = LLMInterface()
 logger.info("LLM initialized: provider=%s, model=%s, endpoint=%s",
-            config["provider"], config["model"], config["endpoint"] or "default")
+            llm_interface.provider, llm_interface.model, llm_interface.endpoint or "default")
+llm = llm_interface.llm
 
 # Token Calculation
 def count_tokens(text: str, provider: str, model: str, max_length: int = 500) -> int:
     try:
-        if provider == "gemini":
-            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-            tokens = encoding.encode(text)[:max_length]
-            return len(tokens)
-        elif provider in ["llama_cpp", "groq"]:
-            encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
-            tokens = encoding.encode(text)[:max_length]
-            return len(tokens)
-        elif provider == "ollama":
-            return min(len(text) // 4, max_length)
-        else:
-            return min(len(text) // 4, max_length)
+        return llm_interface._estimate_tokens(text)
     except Exception as e:
-        logger.warning(f"Token counting failed for {provider}: {str(e)}")
+        logger.warning(f"Token counting failed: {str(e)}")
         return min(len(text) // 4, max_length)
 
 # State Schema
@@ -215,6 +219,14 @@ DETAILED_ANALYSIS_FIELDS = ["rca_details.detailed_analysis"]
 ALL_FIELDS = MINIMAL_FIELDS + REMEDIATION_FIELDS + ROOT_CAUSE_FIELDS + DETAILED_ANALYSIS_FIELDS
 
 async def get_fields_by_request(user_input: str, explicit_fields: Optional[List[str]] = None) -> List[str]:
+    start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "get_fields_by_request",
+        "status": "running",
+        "steps": {}
+    }
     final = set(explicit_fields or MINIMAL_FIELDS)
     query_lower = user_input.lower()
     
@@ -225,12 +237,40 @@ async def get_fields_by_request(user_input: str, explicit_fields: Optional[List[
     is_health_query = any(k in query_lower for k in ["health", "status", "overview"])
     
     if is_full_details:
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return ALL_FIELDS
     elif is_root_cause:
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return list(set(MINIMAL_FIELDS + ROOT_CAUSE_FIELDS))
     elif is_remediation:
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return list(set(MINIMAL_FIELDS + REMEDIATION_FIELDS))
     elif is_health_query:
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return ALL_FIELDS
     
     prompt = f"""System: Return a JSON list of field names relevant to the query. Include all MINIMAL_FIELDS and add fields based on query intent. Do not include explanations or tags like <think>.
@@ -252,17 +292,41 @@ async def get_fields_by_request(user_input: str, explicit_fields: Optional[List[
 
 Example: ["log_id", "timestamp", "error_details.summary", ...]
 """
+    llm_start = time.perf_counter()
     try:
-        response = await llm.ainvoke(prompt)
-        response_text = clean_llm_response(response.content)
+        response, token_counts = await llm_interface.call("", prompt, timeout=30)
+        response_text = clean_llm_response(response)
         fields = extract_json(response_text)
+        metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+        metrics_entry["input_tokens"] = token_counts.get("input_tokens", 0)
+        metrics_entry["output_tokens"] = token_counts.get("output_tokens", 0)
+        with metrics_lock:
+            global_metrics["total_input_tokens"] += token_counts.get("input_tokens", 0)
+            global_metrics["total_output_tokens"] += token_counts.get("output_tokens", 0)
         if not isinstance(fields, list):
             logger.warning(f"LLM returned non-list fields: {response_text}")
             fields = list(final)
         fields = list(set(fields) | set(MINIMAL_FIELDS))
+        metrics_entry["status"] = "success"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return fields
     except Exception as e:
-        logger.error(f"[get_fields_by_request Error] {str(e)}. Raw response: {response_text[:200]}...")
+        logger.error(f"[get_fields_by_request Error] {str(e)}. Raw response: {'N/A' if 'response_text' not in locals() else response_text[:200]}...")
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["total_errors"] += 1
+            global_metrics["node_errors"]["get_fields_by_request"] += 1
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["get_fields_by_request"] += 1
+            global_metrics["node_durations"]["get_fields_by_request"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return list(final)
 
 def format_issue(issue: dict, fields: List[str], is_health_query: bool = False) -> str:
@@ -316,43 +380,63 @@ def format_final_response(response: str, is_health_query: bool = False) -> str:
     return response
 
 # Tool Functions
-def tool_filter(params: str) -> str:
+async def tool_filter(params: str) -> str:
+    start_time = time.perf_counter()
     try:
         data = extract_json(params)
         filters = build_filters(data.get("filters", {}))
         fields = data.get("fields") or MINIMAL_FIELDS
         is_health_query = data.get("is_health_query", False)
         body = {"query": build_es_query(filters), "_source": fields, "size": data.get("size", 100 if is_health_query else 5)}
-        results = es.search(index=INDEX, body=body)
+        results = await es.search(index=INDEX, body=body)
         hits = [hit["_source"] for hit in results["hits"]["hits"]]
         formatted = [format_issue(doc, fields, is_health_query) for doc in hits]
         logger.info(f"Filter matched {len(formatted)} record(s).")
         result = json.dumps(hits) if hits else "NO_RESULTS_FOUND"
+        with metrics_lock:
+            global_metrics["node_counts"]["tool_filter"] += 1
+            global_metrics["node_durations"]["tool_filter"] += (time.perf_counter() - start_time) * 1000
         return result
     except Exception as e:
         logger.error(f"[Filter Tool Error] {str(e)}")
+        with metrics_lock:
+            global_metrics["node_errors"]["tool_filter"] += 1
+            global_metrics["node_counts"]["tool_filter"] += 1
+            global_metrics["node_durations"]["tool_filter"] += (time.perf_counter() - start_time) * 1000
         return json.dumps({"error": str(e)})
 
-def tool_get_by_id(params: str) -> str:
+async def tool_get_by_id(params: str) -> str:
+    start_time = time.perf_counter()
     try:
         data = extract_json(params)
         log_id = data.get("log_id")
         if not log_id:
             raise ValueError("log_id is required")
         fields = data.get("fields") or MINIMAL_FIELDS
-        result = es.search(
+        result = await es.search(
             index=INDEX,
             body={"query": {"term": {"log_id": log_id}}, "_source": fields, "size": 1}
         )
         if not result["hits"]["hits"]:
             return json.dumps({"error": f"No record found for log_id: {log_id}"})
+        with metrics_lock:
+            global_metrics["node_counts"]["tool_get_by_id"] += 1
+            global_metrics["node_durations"]["tool_get_by_id"] += (time.perf_counter() - start_time) * 1000
         return json.dumps(result["hits"]["hits"][0]["_source"])
     except Exception as e:
         logger.error(f"[GetErrorById Error] {str(e)}")
+        with metrics_lock:
+            global_metrics["node_errors"]["tool_get_by_id"] += 1
+            global_metrics["node_counts"]["tool_get_by_id"] += 1
+            global_metrics["node_durations"]["tool_get_by_id"] += (time.perf_counter() - start_time) * 1000
         return json.dumps({"error": str(e)})
 
-def tool_summarize_results(results: str) -> str:
+async def tool_summarize_results(results: str) -> str:
+    start_time = time.perf_counter()
     if not results or results == "NO_RESULTS_FOUND":
+        with metrics_lock:
+            global_metrics["node_counts"]["tool_summarize_results"] += 1
+            global_metrics["node_durations"]["tool_summarize_results"] += (time.perf_counter() - start_time) * 1000
         return "# System Response\n\nNo results to summarize."
     template = LCPromptTemplate(
         input_variables=["text"],
@@ -361,10 +445,10 @@ def tool_summarize_results(results: str) -> str:
     chain = load_summarize_chain(llm, chain_type="stuff", prompt=template)
     documents = [Document(page_content=results)]
     try:
-        response = chain.invoke({"input_documents": documents})
-        logger.info(f"Summarize response type: {type(response)}, content: {str(response)[:200]}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+        response = await chain.ainvoke({"input_documents": documents})
+        logger.info(f"Summarize response type: {type(response)}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
         if isinstance(response, dict):
-            summary = clean_llm_response(response.get("output_text", response.get("content", response.get("text", "Summary could not be generated."))))
+            summary = clean_llm_response(response.get("output_text", response.get("content", "Summary could not be generated.")))
         elif isinstance(response, str):
             summary = clean_llm_response(response)
         elif hasattr(response, "content"):
@@ -372,23 +456,36 @@ def tool_summarize_results(results: str) -> str:
         else:
             logger.error(f"Unexpected response format in summarize_results: {type(response)}, content: {str(response)[:200]}")
             summary = "Summary could not be generated due to unexpected response format."
-        # Ensure the summary is in Markdown
         if not summary.startswith("#"):
             summary = f"# Summary\n\n{summary}"
+        with metrics_lock:
+            global_metrics["node_counts"]["tool_summarize_results"] += 1
+            global_metrics["node_durations"]["tool_summarize_results"] += (time.perf_counter() - start_time) * 1000
         return summary
     except Exception as e:
         logger.error(f"[SummarizeResults Error] {str(e)}, response: {str(response)[:200] if 'response' in locals() else 'N/A'}, traceback: {traceback.format_exc()}")
+        with metrics_lock:
+            global_metrics["node_errors"]["tool_summarize_results"] += 1
+            global_metrics["node_counts"]["tool_summarize_results"] += 1
+            global_metrics["node_durations"]["tool_summarize_results"] += (time.perf_counter() - start_time) * 1000
         return f"# System Response\n\nSummary failed: {str(e)}."
 
 # LangGraph Nodes
 async def classify_query(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
     query = state["query"].lower()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "classify_query",
+        "status": "running",
+        "steps": {}
+    }
+    fields = await get_fields_by_request(query)
+    state["requested_fields"] = fields
     filter_patterns = r'^(list|show|find|give\s+me|all)\b.*(issues|errors|logs)'
     health_patterns = r'\b(health|status|overview|system\s*(health|status))\b'
     log_id_match = re.search(r'[a-zA-Z0-9_-]{20,24}', query)
-    fields = await get_fields_by_request(query)
-    state["requested_fields"] = fields
     if log_id_match:
         query_type = "log_id"
         state["token_usage"][config["provider"]] = {
@@ -426,26 +523,33 @@ Rules:
 - If none of the above, choose unknown.
 Query: {query}
 """
+        llm_start = time.perf_counter()
         try:
-            response = await llm.ainvoke(prompt)
-            query_type = clean_llm_response(response.content.strip())
+            response, token_counts = await llm_interface.call("", prompt, timeout=30)
+            query_type = clean_llm_response(response)
             query_type_match = re.search(r'(log_id|filter|health|summarize|greeting|unknown)', query_type, re.IGNORECASE)
             query_type = query_type_match.group(0).lower() if query_type_match else "unknown"
-            prompt_tokens = count_tokens(prompt, config["provider"], config["model"])
-            completion_tokens = count_tokens(response.content, config["provider"], config["model"])
+            metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+            metrics_entry["input_tokens"] = token_counts.get("input_tokens", 0)
+            metrics_entry["output_tokens"] = token_counts.get("output_tokens", 0)
             state["token_usage"][config["provider"]] = {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens + completion_tokens
+                "prompt_tokens": token_counts.get("input_tokens", 0),
+                "completion_tokens": token_counts.get("output_tokens", 0),
+                "total_tokens": token_counts.get("input_tokens", 0) + token_counts.get("output_tokens", 0)
             }
+            with metrics_lock:
+                global_metrics["total_input_tokens"] += token_counts.get("input_tokens", 0)
+                global_metrics["total_output_tokens"] += token_counts.get("output_tokens", 0)
         except Exception as e:
-            logger.error(f"[classify_query Error] Failed to parse LLM response: {str(e)}. Raw response: {response.content}")
+            logger.error(f"[classify_query Error] Failed to parse LLM response: {str(e)}. Raw response: {'N/A' if 'response' not in locals() else response[:200]}")
             query_type = "unknown"
             state["token_usage"][config["provider"]] = {
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0
             }
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     state["query_type"] = query_type
     state["trace"].append({
         "node": "classify_query",
@@ -456,11 +560,27 @@ Query: {query}
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["classify_query"] = time.perf_counter() - start_time
+    metrics_entry["status"] = metrics_entry.get("status", "success")
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["classify_query"] += 1
+        global_metrics["node_durations"]["classify_query"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["classify_query"] += 1
+    save_metrics()
     return state
 
 async def parse_filters(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
     query = state["query"].lower()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "parse_filters",
+        "status": "success",
+        "steps": {}
+    }
     filters = {"date": {"gte": "now-30d", "lte": "now"}} if state["query_type"] == "health" else {}
     if state["query_type"] != "health":
         if "high severity" in query:
@@ -497,10 +617,23 @@ async def parse_filters(state: ObservibotState) -> ObservibotState:
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["parse_filters"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["parse_filters"] += 1
+        global_metrics["node_durations"]["parse_filters"] += metrics_entry["total_duration_ms"]
+    save_metrics()
     return state
 
 async def execute_filter(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "execute_filter",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -512,20 +645,41 @@ async def execute_filter(state: ObservibotState) -> ObservibotState:
         "fields": fields,
         "is_health_query": state["query_type"] == "health"
     })
-    results = tool_filter(params)
-    state["intermediate_output"] = results
+    try:
+        results = await tool_filter(params)
+        state["intermediate_output"] = results
+    except Exception as e:
+        logger.error(f"[execute_filter Error] {str(e)}")
+        state["intermediate_output"] = json.dumps({"error": str(e)})
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
     state["trace"].append({
         "node": "execute_filter",
         "input": params,
         "fields_used": state.get("requested_fields", []),
-        "output": results,
+        "output": state["intermediate_output"],
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["execute_filter"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["execute_filter"] += 1
+        global_metrics["node_durations"]["execute_filter"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["execute_filter"] += 1
+    save_metrics()
     return state
 
 async def execute_get_by_id(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "execute_get_by_id",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -535,34 +689,49 @@ async def execute_get_by_id(state: ObservibotState) -> ObservibotState:
     log_id = log_id_match.group(0) if log_id_match else None
     if not log_id:
         state["intermediate_output"] = json.dumps({"error": "No valid log_id found in query."})
-        state["trace"].append({
-            "node": "execute_get_by_id",
-            "input": state["query"],
-            "fields_used": state.get("requested_fields", []),
-            "output": state["intermediate_output"],
-            "duration": time.perf_counter() - start_time
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = "No valid log_id found in query."
+    else:
+        params = json.dumps({
+            "log_id": log_id,
+            "user_request": state["query"],
+            "fields": fields
         })
-        state["node_durations"]["execute_get_by_id"] = time.perf_counter() - start_time
-        return state
-    params = json.dumps({
-        "log_id": log_id,
-        "user_request": state["query"],
-        "fields": fields
-    })
-    result = tool_get_by_id(params)
-    state["intermediate_output"] = result
+        try:
+            result = await tool_get_by_id(params)
+            state["intermediate_output"] = result
+        except Exception as e:
+            logger.error(f"[execute_get_by_id Error] {str(e)}")
+            state["intermediate_output"] = json.dumps({"error": str(e)})
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     state["trace"].append({
         "node": "execute_get_by_id",
-        "input": params,
+        "input": params if log_id else state["query"],
         "fields_used": state.get("requested_fields", []),
-        "output": result,
+        "output": state["intermediate_output"],
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["execute_get_by_id"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["execute_get_by_id"] += 1
+        global_metrics["node_durations"]["execute_get_by_id"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["execute_get_by_id"] += 1
+    save_metrics()
     return state
 
 async def execute_health_check(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "execute_health_check",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -574,27 +743,47 @@ async def execute_health_check(state: ObservibotState) -> ObservibotState:
         "fields": fields,
         "is_health_query": True
     })
-    results = tool_filter(params)
-    state["intermediate_output"] = results
+    try:
+        results = await tool_filter(params)
+        state["intermediate_output"] = results
+    except Exception as e:
+        logger.error(f"[execute_health_check Error] {str(e)}")
+        state["intermediate_output"] = json.dumps({"error": str(e)})
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
     state["trace"].append({
         "node": "execute_health_check",
         "input": params,
         "fields_used": state.get("requested_fields", []),
-        "output": results,
+        "output": state["intermediate_output"],
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["execute_health_check"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["execute_health_check"] += 1
+        global_metrics["node_durations"]["execute_health_check"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["execute_health_check"] += 1
+    save_metrics()
     return state
 
 async def transform_output(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "transform_output",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
     else:
         fields = state.get("requested_fields", MINIMAL_FIELDS)
     
-    # Handle empty or invalid intermediate_output
     if not state.get("intermediate_output") or state["intermediate_output"] == "NO_RESULTS_FOUND":
         state["final_output"] = "# System Response\n\nNo matching records found for the query."
         state["trace"].append({
@@ -606,9 +795,14 @@ async def transform_output(state: ObservibotState) -> ObservibotState:
             "duration": time.perf_counter() - start_time
         })
         state["node_durations"]["transform_output"] = time.perf_counter() - start_time
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["transform_output"] += 1
+            global_metrics["node_durations"]["transform_output"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return state
     
-    # Try to parse intermediate_output as JSON
     try:
         result = json.loads(state["intermediate_output"])
         if isinstance(result, dict) and "error" in result:
@@ -622,6 +816,12 @@ async def transform_output(state: ObservibotState) -> ObservibotState:
                 "duration": time.perf_counter() - start_time
             })
             state["node_durations"]["transform_output"] = time.perf_counter() - start_time
+            metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+            with metrics_lock:
+                global_metrics["runs"].append(metrics_entry)
+                global_metrics["node_counts"]["transform_output"] += 1
+                global_metrics["node_durations"]["transform_output"] += metrics_entry["total_duration_ms"]
+            save_metrics()
             return state
         logs = [result] if isinstance(result, dict) else result
         limited_input = json.dumps(logs)
@@ -637,9 +837,19 @@ async def transform_output(state: ObservibotState) -> ObservibotState:
             "duration": time.perf_counter() - start_time
         })
         state["node_durations"]["transform_output"] = time.perf_counter() - start_time
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = "Invalid response format from query execution"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["transform_output"] += 1
+            global_metrics["node_durations"]["transform_output"] += metrics_entry["total_duration_ms"]
+            global_metrics["node_errors"]["transform_output"] += 1
+        save_metrics()
         return state
     
     query_type = state["query_type"].lower()
+    llm_start = time.perf_counter()
     if query_type == "filter":
         formatted_logs = [format_issue(log, fields, is_health_query=False) for log in logs]
         summary = f"# Query Results: {state['query']}\n\n"
@@ -671,9 +881,9 @@ Logs:
         documents = [Document(page_content=limited_input)]
         try:
             response = await chain.ainvoke({"input_documents": documents})
-            logger.info(f"Transform response type: {type(response)}, content: {str(response)[:200]}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+            logger.info(f"Transform response type: {type(response)}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
             if isinstance(response, dict):
-                summary = clean_llm_response(response.get("output_text", response.get("content", response.get("text", "Summary could not be generated."))))
+                summary = clean_llm_response(response.get("output_text", response.get("content", "Summary could not be generated.")))
             elif isinstance(response, str):
                 summary = clean_llm_response(response)
             elif hasattr(response, "content"):
@@ -683,13 +893,19 @@ Logs:
                 summary = "Summary could not be generated due to unexpected response format."
             if not summary.startswith("#"):
                 summary = f"# System Health Summary\n\n{summary}"
-            prompt_tokens = count_tokens(prompt_template.template.format(text=limited_input), config["provider"], config["model"])
+            prompt = prompt_template.template.format(text=limited_input)
+            prompt_tokens = count_tokens(prompt, config["provider"], config["model"])
             completion_tokens = count_tokens(summary, config["provider"], config["model"])
+            metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+            metrics_entry["input_tokens"] = prompt_tokens
+            metrics_entry["output_tokens"] = completion_tokens
         except Exception as e:
             logger.error(f"[transform_output Error] {str(e)}, response: {str(response)[:200] if 'response' in locals() else 'N/A'}, traceback: {traceback.format_exc()}")
             summary = f"# System Response\n\nSummary failed: {str(e)}."
             prompt_tokens = count_tokens(limited_input, config["provider"], config["model"])
             completion_tokens = 0
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     elif query_type == "log_id":
         formatted_logs = [format_issue(log, fields, is_health_query=False) for log in logs]
         summary = f"# Log Details: {state['query']}\n\n"
@@ -718,9 +934,9 @@ Logs:
         documents = [Document(page_content=limited_input)]
         try:
             response = await chain.ainvoke({"input_documents": documents, "text": limited_input, "query": state["query"]})
-            logger.info(f"Transform response type: {type(response)}, content: {str(response)[:200]}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
+            logger.info(f"Transform response type: {type(response)}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
             if isinstance(response, dict):
-                summary = clean_llm_response(response.get("output_text", response.get("content", response.get("text", "Summary could not be generated."))))
+                summary = clean_llm_response(response.get("output_text", response.get("content", "Summary could not be generated.")))
             elif isinstance(response, str):
                 summary = clean_llm_response(response)
             elif hasattr(response, "content"):
@@ -730,13 +946,19 @@ Logs:
                 summary = "Summary could not be generated due to unexpected response format."
             if not summary.startswith("#"):
                 summary = f"# Summary for Query: {state['query']}\n\n{summary}"
-            prompt_tokens = count_tokens(prompt_template.template.format(text=limited_input, query=state["query"]), config["provider"], config["model"])
+            prompt = prompt_template.template.format(text=limited_input, query=state["query"])
+            prompt_tokens = count_tokens(prompt, config["provider"], config["model"])
             completion_tokens = count_tokens(summary, config["provider"], config["model"])
+            metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+            metrics_entry["input_tokens"] = prompt_tokens
+            metrics_entry["output_tokens"] = completion_tokens
         except Exception as e:
             logger.error(f"[transform_output Error] {str(e)}, response: {str(response)[:200] if 'response' in locals() else 'N/A'}, traceback: {traceback.format_exc()}")
             summary = f"# System Response\n\nSummary failed: {str(e)}."
             prompt_tokens = count_tokens(limited_input, config["provider"], config["model"])
             completion_tokens = 0
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     elif query_type == "greeting":
         summary = "# System Response\n\nHello! How can I assist you with Observix analytics today?"
         prompt_tokens = count_tokens("greeting", config["provider"], config["model"])
@@ -755,31 +977,31 @@ Input:
 """
         )
         try:
-            response = await llm.ainvoke(prompt_template.format(text=limited_input, query=state["query"]))
-            logger.info(f"Transform response type: {type(response)}, content: {str(response)[:200]}, keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'}")
-            if isinstance(response, dict):
-                summary = clean_llm_response(response.get("content", response.get("text", "Response could not be generated.")))
-            elif isinstance(response, str):
-                summary = clean_llm_response(response)
-            elif hasattr(response, "content"):
-                summary = clean_llm_response(response.content)
-            else:
-                logger.error(f"Unexpected response format in transform_output: {type(response)}, content: {str(response)[:200]}")
-                summary = "Response could not be generated due to unexpected response format."
+            prompt = prompt_template.format(text=limited_input, query=state["query"])
+            response, token_counts = await llm_interface.call("", prompt, timeout=30)
+            summary = clean_llm_response(response)
             if not summary.startswith("#"):
                 summary = f"# Response to Query: {state['query']}\n\n{summary}"
-            prompt_tokens = count_tokens(prompt_template.template.format(text=limited_input, query=state["query"]), config["provider"], config["model"])
-            completion_tokens = count_tokens(summary, config["provider"], config["model"])
+            prompt_tokens = token_counts.get("input_tokens", 0)
+            completion_tokens = token_counts.get("output_tokens", 0)
+            metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+            metrics_entry["input_tokens"] = prompt_tokens
+            metrics_entry["output_tokens"] = completion_tokens
         except Exception as e:
             logger.error(f"[transform_output Error] {str(e)}, response: {str(response)[:200] if 'response' in locals() else 'N/A'}, traceback: {traceback.format_exc()}")
             summary = f"# System Response\n\nError: Unable to process query: {str(e)}."
             prompt_tokens = count_tokens(limited_input, config["provider"], config["model"])
             completion_tokens = 0
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     state["token_usage"][config["provider"]] = {
         "prompt_tokens": state["token_usage"].get(config["provider"], {}).get("prompt_tokens", 0) + prompt_tokens,
         "completion_tokens": state["token_usage"].get(config["provider"], {}).get("completion_tokens", 0) + completion_tokens,
         "total_tokens": state["token_usage"].get(config["provider"], {}).get("total_tokens", 0) + prompt_tokens + completion_tokens
     }
+    with metrics_lock:
+        global_metrics["total_input_tokens"] += prompt_tokens
+        global_metrics["total_output_tokens"] += completion_tokens
     state["final_output"] = summary
     state["trace"].append({
         "node": "transform_output",
@@ -790,10 +1012,25 @@ Input:
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["transform_output"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["transform_output"] += 1
+        global_metrics["node_durations"]["transform_output"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["transform_output"] += 1
+    save_metrics()
     return state
 
 async def summarize_results(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "summarize_results",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -808,16 +1045,33 @@ async def summarize_results(state: ObservibotState) -> ObservibotState:
             "duration": time.perf_counter() - start_time
         })
         state["node_durations"]["summarize_results"] = time.perf_counter() - start_time
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["summarize_results"] += 1
+            global_metrics["node_durations"]["summarize_results"] += metrics_entry["total_duration_ms"]
+        save_metrics()
         return state
     results_text = state["intermediate_output"]
-    summary = tool_summarize_results(results_text)
-    prompt_tokens = count_tokens(results_text, config["provider"], config["model"])
-    completion_tokens = count_tokens(summary, config["provider"], config["model"])
+    try:
+        summary = await tool_summarize_results(results_text)
+        prompt_tokens = count_tokens(results_text, config["provider"], config["model"])
+        completion_tokens = count_tokens(summary, config["provider"], config["model"])
+    except Exception as e:
+        logger.error(f"[summarize_results Error] {str(e)}")
+        summary = f"# System Response\n\nSummary failed: {str(e)}."
+        prompt_tokens = count_tokens(results_text, config["provider"], config["model"])
+        completion_tokens = 0
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
     state["token_usage"][config["provider"]] = {
         "prompt_tokens": state["token_usage"].get(config["provider"], {}).get("prompt_tokens", 0) + prompt_tokens,
         "completion_tokens": state["token_usage"].get(config["provider"], {}).get("completion_tokens", 0) + completion_tokens,
         "total_tokens": state["token_usage"].get(config["provider"], {}).get("total_tokens", 0) + prompt_tokens + completion_tokens
     }
+    with metrics_lock:
+        global_metrics["total_input_tokens"] += prompt_tokens
+        global_metrics["total_output_tokens"] += completion_tokens
     state["final_output"] = summary
     state["trace"].append({
         "node": "summarize_results",
@@ -828,10 +1082,25 @@ async def summarize_results(state: ObservibotState) -> ObservibotState:
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["summarize_results"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["summarize_results"] += 1
+        global_metrics["node_durations"]["summarize_results"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["summarize_results"] += 1
+    save_metrics()
     return state
 
 async def direct_answer(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "direct_answer",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -844,10 +1113,23 @@ async def direct_answer(state: ObservibotState) -> ObservibotState:
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["direct_answer"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["direct_answer"] += 1
+        global_metrics["node_durations"]["direct_answer"] += metrics_entry["total_duration_ms"]
+    save_metrics()
     return state
 
 async def handle_error(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "handle_error",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -860,10 +1142,23 @@ async def handle_error(state: ObservibotState) -> ObservibotState:
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["handle_error"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["handle_error"] += 1
+        global_metrics["node_durations"]["handle_error"] += metrics_entry["total_duration_ms"]
+    save_metrics()
     return state
 
 async def dynamic_reasoning(state: ObservibotState) -> ObservibotState:
     start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "dynamic_reasoning",
+        "status": "success",
+        "steps": {}
+    }
     if not state.get("requested_fields"):
         fields = await get_fields_by_request(state["query"])
         state["requested_fields"] = fields
@@ -877,6 +1172,15 @@ async def dynamic_reasoning(state: ObservibotState) -> ObservibotState:
             "duration": time.perf_counter() - start_time
         })
         state["node_durations"]["dynamic_reasoning"] = time.perf_counter() - start_time
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = "Maximum reasoning iterations reached"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["dynamic_reasoning"] += 1
+            global_metrics["node_durations"]["dynamic_reasoning"] += metrics_entry["total_duration_ms"]
+            global_metrics["node_errors"]["dynamic_reasoning"] += 1
+        save_metrics()
         return state
     tools = ["FilterObservix", "GetErrorById", "SummarizeResults", "DirectAnswer"]
     subgraphs = ["log_id_subgraph", "filter_subgraph", "health_subgraph", "summarize_subgraph", "greeting_subgraph"]
@@ -908,19 +1212,26 @@ You are Observibot, an expert Observix analyst. Handle a query that doesn't matc
    - "input": Input for the tool/subgraph or final answer.
    - "reasoning": Brief explanation of the choice.
 """
+    llm_start = time.perf_counter()
     try:
-        response = await llm.ainvoke(prompt)
-        decision = extract_json(clean_llm_response(response.content))
-        prompt_tokens = count_tokens(prompt, config["provider"], config["model"])
-        completion_tokens = count_tokens(response.content, config["provider"], config["model"])
+        response, token_counts = await llm_interface.call("", prompt, timeout=30)
+        decision = extract_json(clean_llm_response(response))
+        metrics_entry["steps"]["llm_call"] = {"duration_ms": (time.perf_counter() - llm_start) * 1000}
+        metrics_entry["input_tokens"] = token_counts.get("input_tokens", 0)
+        metrics_entry["output_tokens"] = token_counts.get("output_tokens", 0)
         state["token_usage"][config["provider"]] = {
-            "prompt_tokens": state["token_usage"].get(config["provider"], {}).get("prompt_tokens", 0) + prompt_tokens,
-            "completion_tokens": state["token_usage"].get(config["provider"], {}).get("completion_tokens", 0) + completion_tokens,
-            "total_tokens": state["token_usage"].get(config["provider"], {}).get("total_tokens", 0) + prompt_tokens + completion_tokens
+            "prompt_tokens": state["token_usage"].get(config["provider"], {}).get("prompt_tokens", 0) + token_counts.get("input_tokens", 0),
+            "completion_tokens": state["token_usage"].get(config["provider"], {}).get("completion_tokens", 0) + token_counts.get("output_tokens", 0),
+            "total_tokens": state["token_usage"].get(config["provider"], {}).get("total_tokens", 0) + token_counts.get("input_tokens", 0) + token_counts.get("output_tokens", 0)
         }
+        with metrics_lock:
+            global_metrics["total_input_tokens"] += token_counts.get("input_tokens", 0)
+            global_metrics["total_output_tokens"] += token_counts.get("output_tokens", 0)
     except Exception as e:
-        logger.error(f"[dynamic_reasoning Error] Failed to parse LLM response: {str(e)}. Raw response: {response.content}")
+        logger.error(f"[dynamic_reasoning Error] Failed to parse LLM response: {str(e)}. Raw response: {'N/A' if 'response' in locals() else response[:200]}")
         decision = {"action": "none", "input": json.dumps({"error": "Unable to process query due to LLM response parsing failure."}), "reasoning": str(e)}
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
     action = decision.get("action", "none")
     action_input = decision.get("input", "")
     reasoning = decision.get("reasoning", "N/A")
@@ -931,7 +1242,6 @@ You are Observibot, an expert Observix analyst. Handle a query that doesn't matc
     })
     if action == "none":
         state["intermediate_output"] = action_input
-        # Ensure direct answers are in Markdown
         try:
             parsed_input = json.loads(action_input)
             if isinstance(parsed_input, dict) and "error" in parsed_input:
@@ -947,9 +1257,16 @@ You are Observibot, an expert Observix analyst. Handle a query that doesn't matc
             "SummarizeResults": tool_summarize_results,
             "DirectAnswer": lambda x: f"# System Response\n\n{x}"
         }
-        result = tool_map[action](action_input)
-        state["intermediate_output"] = result
-        state["agent_scratchpad"].append({"observation": result})
+        try:
+            result = await tool_map[action](action_input)
+            state["intermediate_output"] = result
+            state["agent_scratchpad"].append({"observation": result})
+        except Exception as e:
+            logger.error(f"[dynamic_reasoning Tool Error] {str(e)}")
+            state["intermediate_output"] = json.dumps({"error": str(e)})
+            state["agent_scratchpad"].append({"observation": f"Error: {str(e)}"})
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
     elif action in subgraphs:
         state["query_type"] = action.replace("_subgraph", "")
         state["agent_scratchpad"].append({"observation": f"Routed to {action}"})
@@ -962,6 +1279,14 @@ You are Observibot, an expert Observix analyst. Handle a query that doesn't matc
         "duration": time.perf_counter() - start_time
     })
     state["node_durations"]["dynamic_reasoning"] = time.perf_counter() - start_time
+    metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+    with metrics_lock:
+        global_metrics["runs"].append(metrics_entry)
+        global_metrics["node_counts"]["dynamic_reasoning"] += 1
+        global_metrics["node_durations"]["dynamic_reasoning"] += metrics_entry["total_duration_ms"]
+        if metrics_entry.get("status") == "error":
+            global_metrics["node_errors"]["dynamic_reasoning"] += 1
+    save_metrics()
     return state
 
 # Subgraphs
@@ -1089,21 +1414,166 @@ compiled_workflow = main_workflow.compile()
 # Session History Management
 session_histories = {}
 def get_session_history(sid: str) -> ChatMessageHistory:
-    if sid not in session_histories:
-        session_histories[sid] = ChatMessageHistory()
+    with metrics_lock:
+        if sid not in session_histories:
+            session_histories[sid] = ChatMessageHistory()
+            global_metrics["node_counts"]["session_creation"] += 1
     return session_histories[sid]
 
 def get_or_generate_session_id(session_id: Optional[str]) -> str:
     return session_id or str(uuid4())
 
-# API Endpoints
+# Health Endpoint
+@app.get("/health")
+async def health():
+    start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "health_check",
+        "status": "success",
+        "steps": {}
+    }
+    try:
+        # Elasticsearch Health Check
+        es_start = time.perf_counter()
+        try:
+            es_status = await es.ping()
+            es_status_str = "connected" if es_status else "disconnected"
+        except Exception as e:
+            logger.error(f"[Elasticsearch Health Error] {str(e)}")
+            es_status_str = "disconnected"
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = metrics_entry.get("error", "") + f" Elasticsearch: {str(e)}"
+        metrics_entry["steps"]["elasticsearch"] = {"duration_ms": (time.perf_counter() - es_start) * 1000}
+        
+        # LLM Endpoint Availability Check
+        llm_start = time.perf_counter()
+        llm_status_str = "reachable"
+        endpoint = llm_interface.endpoint or "default"
+        
+        # Providers that don't require a custom endpoint (e.g., Gemini, Groq)
+        if llm_interface.provider in ["gemini", "groq"] and endpoint == "default":
+            # For Gemini and Groq, assume API is reachable if API key is provided
+            if llm_interface.api_key:
+                llm_status_str = "reachable (API key provided)"
+            else:
+                llm_status_str = "unreachable (API key missing)"
+                metrics_entry["status"] = "error"
+                metrics_entry["error"] = metrics_entry.get("error", "") + " LLM: API key missing"
+        else:
+            # Providers requiring an endpoint (e.g., ollama, llama_cpp, openrouter)
+            try:
+                if not endpoint.startswith(("http://", "https://")):
+                    raise ValueError("Request URL is missing an 'http://' or 'https://' protocol.")
+                async with httpx.AsyncClient(timeout=10) as client:
+                    response = await client.get(endpoint)  # Use HEAD if supported by the API
+                    if response.status_code in (200, 201, 204):
+                        llm_status_str = "reachable"
+                    else:
+                        llm_status_str = f"unreachable (status: {response.status_code})"
+                        metrics_entry["status"] = "error"
+                        metrics_entry["error"] = metrics_entry.get("error", "") + f" LLM endpoint returned {response.status_code}"
+            except Exception as e:
+                logger.error(f"[LLM Endpoint Availability Error] {str(e)}")
+                llm_status_str = f"unreachable ({str(e)})"
+                metrics_entry["status"] = "error"
+                metrics_entry["error"] = metrics_entry.get("error", "") + f" LLM: {str(e)}"
+        metrics_entry["steps"]["llm"] = {
+            "duration_ms": (time.perf_counter() - llm_start) * 1000
+        }
+        
+        # Thread Pool Stats
+        thread_start = time.perf_counter()
+        thread_info = {
+            "active_threads": threading.active_count(),
+            "thread_names": [t.name for t in threading.enumerate()],
+            "is_blocked": threading.active_count() > 50  # Arbitrary threshold for blockage detection
+        }
+        metrics_entry["steps"]["threading"] = {"duration_ms": (time.perf_counter() - thread_start) * 1000}
+        
+        # Metrics Calculation
+        with metrics_lock:
+            total_queries = global_metrics["total_queries_processed"]
+            error_rate = global_metrics["total_errors"] / total_queries if total_queries > 0 else 0
+            avg_input_tokens = global_metrics["total_input_tokens"] / total_queries if total_queries > 0 else 0
+            avg_output_tokens = global_metrics["total_output_tokens"] / total_queries if total_queries > 0 else 0
+            uptime_hours = (time.time() - global_metrics["start_time"]) / 3600
+            recent_runs = global_metrics["runs"][-10:]
+            last_run = recent_runs[-1] if recent_runs else {"timestamp": None, "function": "N/A", "status": "N/A"}
+        
+        response = {
+            "status": "healthy" if metrics_entry["status"] == "success" else "unhealthy",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "uptime_hours": round(uptime_hours, 2),
+            "elasticsearch": {
+                "status": es_status_str,
+                "url": ES_URL,
+                "index": INDEX
+            },
+            "llm": {
+                "status": llm_status_str,
+                "provider": llm_interface.provider,
+                "model": llm_interface.model,
+                "endpoint": llm_interface.endpoint or "default"
+            },
+            "threading": thread_info,
+            "metrics": {
+                "total_queries_processed": total_queries,
+                "total_errors": global_metrics["total_errors"],
+                "error_rate": round(error_rate, 4),
+                "avg_input_tokens": round(avg_input_tokens, 2),
+                "avg_output_tokens": round(avg_output_tokens, 2),
+                "node_counts": dict(global_metrics["node_counts"]),
+                "node_durations_ms": {k: round(v, 2) for k, v in global_metrics["node_durations"].items()},
+                "node_errors": dict(global_metrics["node_errors"]),
+                "last_run": last_run
+            }
+        }
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["health_check"] += 1
+            global_metrics["node_durations"]["health_check"] += metrics_entry["total_duration_ms"]
+            if metrics_entry.get("status") == "error":
+                global_metrics["node_errors"]["health_check"] += 1
+        save_metrics()
+        return JSONResponse(content=response)
+    except Exception as e:
+        logger.error(f"[Health Endpoint Error] {str(e)}")
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = metrics_entry.get("error", "") + f" General: {str(e)}"
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["health_check"] += 1
+            global_metrics["node_durations"]["health_check"] += metrics_entry["total_duration_ms"]
+            global_metrics["node_errors"]["health_check"] += 1
+        save_metrics()
+        return JSONResponse(
+            content={
+                "status": "unhealthy",
+                "error": str(e),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            },
+            status_code=500
+        )
+
+# Chat Endpoint
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "chat_endpoint",
+        "status": "success",
+        "steps": {}
+    }
+    session_id = get_or_generate_session_id(request.session_id)
+    history = get_session_history(session_id)
     try:
-        session_id = get_or_generate_session_id(request.session_id)
-        logger.info(f"[User Query] {request.query} | SID: {session_id}")
-        start_time = time.perf_counter()
-        history = get_session_history(session_id)
+        # Initialize state
         state = ObservibotState(
             query=request.query,
             session_id=session_id,
@@ -1113,48 +1583,94 @@ async def chat(request: ChatRequest):
             intermediate_output=None,
             final_output=None,
             token_usage={config["provider"]: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-            chat_history=history.messages,
+            chat_history=[
+                {
+                    "role": "human" if isinstance(msg, HumanMessage) else "assistant",
+                    "content": msg.content
+                }
+                for msg in history.messages
+            ],
             trace=[],
             agent_scratchpad=[],
             node_durations={}
         )
-        result = await compiled_workflow.ainvoke(state)
-        logger.info(f"Workflow result: type={type(result)}, keys={list(result.keys())}, final_output={result.get('final_output', 'N/A')[:200]}")
-        history.add_user_message(request.query)
-        history.add_ai_message(result["final_output"])
-        elapsed_seconds = time.perf_counter() - start_time
-        logger.info(f"[Latency] {elapsed_seconds} s")
-        log_and_truncate_response(result["final_output"])
-        total_tokens = {
-            "prompt_tokens": sum(
-                usage.get("prompt_tokens", 0) for usage in result["token_usage"].values()
-            ),
-            "completion_tokens": sum(
-                usage.get("completion_tokens", 0) for usage in result["token_usage"].values()
-            ),
-            "total_tokens": sum(
-                usage.get("total_tokens", 0) for usage in result["token_usage"].values()
-            )
-        }
-        return {
-            "status": "success",
+        
+        # Execute workflow
+        workflow_start = time.perf_counter()
+        try:
+            result = await compiled_workflow.ainvoke(state)
+            metrics_entry["steps"]["workflow"] = {"duration_ms": (time.perf_counter() - workflow_start) * 1000}
+        except Exception as e:
+            logger.error(f"[Workflow Error] {str(e)}, traceback: {traceback.format_exc()}")
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
+            result = {
+                "final_output": f"# System Response\n\nError: Unable to process query due to workflow failure: {str(e)}.",
+                "token_usage": state["token_usage"],
+                "trace": state["trace"] + [{
+                    "node": "workflow",
+                    "input": state["query"],
+                    "output": f"Error: {str(e)}",
+                    "duration": time.perf_counter() - workflow_start
+                }],
+                "node_durations": state["node_durations"]
+            }
+        
+        # Update history
+        history.add_message(HumanMessage(content=request.query))
+        final_output = result.get("final_output", "# System Response\n\nNo response generated.")
+        history.add_message(AIMessage(content=final_output))
+        
+        # Format response
+        response = {
+            "response": format_final_response(final_output, is_health_query=result.get("query_type") == "health"),
             "session_id": session_id,
-            "response": result["final_output"],
-            "total_tokens": total_tokens,
-            "requested_fields": result.get("requested_fields", []),
-            "node_durations": result["node_durations"]
+            "token_usage": result["token_usage"],
+            "trace": result["trace"],
+            "node_durations": {k: round(v * 1000, 2) for k, v in result["node_durations"].items()}
         }
+        log_and_truncate_response(response)
+        
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["total_queries_processed"] += 1
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["chat_endpoint"] += 1
+            global_metrics["node_durations"]["chat_endpoint"] += metrics_entry["total_duration_ms"]
+            if metrics_entry.get("status") == "error":
+                global_metrics["node_errors"]["chat_endpoint"] += 1
+                global_metrics["total_errors"] += 1
+        save_metrics()
+        return JSONResponse(content=response)
     except Exception as e:
         logger.error(f"[Chat Endpoint Error] {str(e)}, traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"# System Response\n\nInternal Server Error: {str(e)}")
-
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["total_queries_processed"] += 1
+            global_metrics["total_errors"] += 1
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["chat_endpoint"] += 1
+            global_metrics["node_durations"]["chat_endpoint"] += metrics_entry["total_duration_ms"]
+            global_metrics["node_errors"]["chat_endpoint"] += 1
+        save_metrics()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+# Trace Endpoint
 @app.post("/trace")
 async def trace(request: TraceRequest):
+    start_time = time.perf_counter()
+    metrics_entry = {
+        "run_id": str(uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "function": "trace_endpoint",
+        "status": "success",
+        "steps": {}
+    }
+    session_id = get_or_generate_session_id(request.session_id)
+    history = get_session_history(session_id)
     try:
-        session_id = get_or_generate_session_id(request.session_id)
-        logger.info(f"[Trace Query] {request.query} | SID: {session_id}")
-        start_time = time.perf_counter()
-        history = get_session_history(session_id)
+        # Initialize state
         state = ObservibotState(
             query=request.query,
             session_id=session_id,
@@ -1164,44 +1680,66 @@ async def trace(request: TraceRequest):
             intermediate_output=None,
             final_output=None,
             token_usage={config["provider"]: {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}},
-            chat_history=history.messages,
+            chat_history=[{"role": msg.role, "content": msg.content} for msg in history.messages],
             trace=[],
             agent_scratchpad=[],
             node_durations={}
         )
-        result = await compiled_workflow.ainvoke(state)
-        logger.info(f"Workflow result: type={type(result)}, keys={list(result.keys())}, final_output={result.get('final_output', 'N/A')[:200]}")
-        history.add_user_message(request.query)
-        history.add_ai_message(result["final_output"])
-        elapsed_seconds = time.perf_counter() - start_time
-        logger.info(f"[Latency] {elapsed_seconds} s")
-        total_tokens = {
-            "prompt_tokens": sum(
-                usage.get("prompt_tokens", 0) for usage in result["token_usage"].values()
-            ),
-            "completion_tokens": sum(
-                usage.get("completion_tokens", 0) for usage in result["token_usage"].values()
-            ),
-            "total_tokens": sum(
-                usage.get("total_tokens", 0) for usage in result["token_usage"].values()
-            )
-        }
-        result_dict = {
-            "status": "success",
+        
+        # Execute workflow
+        workflow_start = time.perf_counter()
+        try:
+            result = await compiled_workflow.ainvoke(state)
+            metrics_entry["steps"]["workflow"] = {"duration_ms": (time.perf_counter() - workflow_start) * 1000}
+        except Exception as e:
+            logger.error(f"[Workflow Error] {str(e)}, traceback: {traceback.format_exc()}")
+            metrics_entry["status"] = "error"
+            metrics_entry["error"] = str(e)
+            result = {
+                "trace": state["trace"] + [{
+                    "node": "workflow",
+                    "input": state["query"],
+                    "output": f"Error: {str(e)}",
+                    "duration": time.perf_counter() - workflow_start
+                }],
+                "token_usage": state["token_usage"],
+                "node_durations": state["node_durations"]
+            }
+        
+        # Format trace response
+        response = {
             "trace": result["trace"],
-            "final_output": result["final_output"],
             "session_id": session_id,
-            "total_tokens": total_tokens,
-            "requested_fields": result.get("requested_fields", []),
-            "node_durations": result["node_durations"]
+            "token_usage": result["token_usage"],
+            "node_durations": {k: round(v * 1000, 2) for k, v in result["node_durations"].items()}
         }
-        log_and_truncate_response(result_dict)
-        return JSONResponse(content=result_dict)
+        log_and_truncate_response(response)
+        
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["total_queries_processed"] += 1
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["trace_endpoint"] += 1
+            global_metrics["node_durations"]["trace_endpoint"] += metrics_entry["total_duration_ms"]
+            if metrics_entry.get("status") == "error":
+                global_metrics["node_errors"]["trace_endpoint"] += 1
+                global_metrics["total_errors"] += 1
+        save_metrics()
+        return JSONResponse(content=response)
     except Exception as e:
         logger.error(f"[Trace Endpoint Error] {str(e)}, traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"# System Response\n\nError: {str(e)}. Please verify Elasticsearch or LLM connectivity and try again.")
+        metrics_entry["status"] = "error"
+        metrics_entry["error"] = str(e)
+        metrics_entry["total_duration_ms"] = (time.perf_counter() - start_time) * 1000
+        with metrics_lock:
+            global_metrics["total_queries_processed"] += 1
+            global_metrics["total_errors"] += 1
+            global_metrics["runs"].append(metrics_entry)
+            global_metrics["node_counts"]["trace_endpoint"] += 1
+            global_metrics["node_durations"]["trace_endpoint"] += metrics_entry["total_duration_ms"]
+            global_metrics["node_errors"]["trace_endpoint"] += 1
+        save_metrics()
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
-# Main Entry
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8200, log_level="info")
+
+

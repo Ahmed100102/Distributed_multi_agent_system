@@ -1,133 +1,87 @@
-# Root Cause Analysis (RCA) Agent Documentation
+# RCA (Root Cause Analysis) Agent
+
+The `rca_agent.py` script implements a sophisticated agent for performing root cause analysis on log anomalies. It leverages a combination of Kafka for message queuing, FastAPI for health monitoring, and LangGraph to orchestrate the analysis workflow.
 
 ## Overview
-The RCA Agent is responsible for analyzing system anomalies and determining their root causes. It uses a combination of LLM capabilities and predefined tools to process anomalies from Kafka and publish analysis results.
+
+The RCA Agent is designed to:
+
+1.  Consume log anomaly messages from a Kafka topic.
+2.  Validate the incoming log data.
+3.  Use a Large Language Model (LLM) to perform a detailed root cause analysis.
+4.  Publish the analysis results to another Kafka topic.
+5.  Provide a health check endpoint for monitoring.
 
 ## Architecture
 
-### Components
-1. **Kafka Consumer**
-   - Subscribes to: `logs.anomalies`
-   - Group ID: `rca_group`
-   - Manual offset control for reliability
+The agent is built on the following components:
 
-2. **Kafka Producer**
-   - Publishes to: `logs.rca.output`
-   - Configured for reliable delivery (acks=all)
-   - Automatic retries
+-   **Kafka:** Used for asynchronous communication. It consumes from the `logs.anomalies` topic and produces to the `logs.rca.output` topic.
+-   **FastAPI:** Provides an HTTP server with a `/health` endpoint for monitoring the agent's status and metrics.
+-   **LangGraph:** A library for building stateful, multi-actor applications with LLMs. It is used to define and execute the agent's workflow as a graph.
+-   **LLMInterface:** The custom interface for interacting with the configured LLM.
 
-3. **LLM Interface**
-   - Uses configured LLM provider (default: Ollama)
-   - Model specified by `LLM_MODEL_RCA`
-   - Processes anomaly data for analysis
+## State Management
 
-### Configuration
+The agent's state is managed using the `AgentState` TypedDict. This dictionary holds all the information required for the agent to process a log message, including:
 
-#### Kafka Settings
-```python
-kafka_config = {
-    "bootstrap.servers": "localhost:9092",
-    "group.id": "rca_group",
-    "auto.offset.reset": "earliest",
-    "enable.auto.commit": False,
-    "max.poll.interval.ms": 1800000,
-    "session.timeout.ms": 300000,
-    "heartbeat.interval.ms": 10000,
-    "fetch.min.bytes": 1,
-    "fetch.wait.max.ms": 500
-}
-```
+-   `log_data`: The raw log data from Kafka.
+-   `rca_result`: The result of the root cause analysis.
+-   `publish_result`: The status of the Kafka publishing step.
+-   `metrics`: A dictionary for storing performance metrics.
+-   `processed_ids`: A set to keep track of processed log IDs to avoid duplicates.
+-   `model_status`: The current status of the LLM.
+-   `current_log_message`: The log message being processed.
+-   `validation_passed`: A boolean to indicate if the input validation was successful.
 
-#### Environment Variables
-- `KAFKA_BOOTSTRAP_SERVERS`: Kafka cluster address
-- `LLM_PROVIDER`: LLM provider selection
-- `LLM_MODEL_RCA`: Model for analysis
-- `LLM_ENDPOINT`: LLM API endpoint
+## Workflow
 
-## Tools
+The agent's workflow is defined as a LangGraph graph with the following steps:
 
-### PublishRCAResults
-Publishes analysis results to Kafka topic `logs.rca.output`
+1.  **Consume Kafka (`consume_kafka`):** The agent polls the `logs.anomalies` topic for new messages.
 
-#### Input Format:
-```json
-{
-    "log_id": "unique_identifier",
-    "rca": {
-        "summary": "Brief description",
-        "detailed_analysis": "Comprehensive analysis",
-        "root_causes": [
-            {
-                "cause": "Identified cause",
-                "probability": "HIGH|MEDIUM|LOW",
-                "impact_areas": ["area1", "area2"],
-                "technical_details": "Technical explanation"
-            }
-        ]
-    },
-    "recommended_actions": ["action1", "action2"],
-    "severity": "HIGH|MEDIUM|LOW"
-}
-```
+2.  **Validate Input (`validate_input`):**
+    -   It checks if the message is valid JSON and contains the required fields (`_id`, `log_message`).
+    -   It also checks if the log ID has already been processed.
 
-## Prompt Engineering
+3.  **Perform RCA (`perform_rca`):**
+    -   If the input is valid, the agent constructs a detailed prompt for the LLM.
+    -   It calls the LLM to perform the root cause analysis.
+    -   The LLM's response is cleaned and parsed into a JSON object.
 
-### System Prompt
-The agent uses a carefully crafted system prompt that:
-- Defines the agent's role
-- Specifies input validation requirements
-- Provides response format guidelines
-- Includes example interactions
+4.  **Publish to Kafka (`publish_to_kafka_rca`):**
+    -   The RCA result is published to the `logs.rca.output` topic.
 
-### Response Format
-```
-Thought: [Analysis reasoning]
-Action: PublishRCAResults
-Action Input: [RCA JSON]
-Observation: [Tool response]
-Final Answer: [Status confirmation]
-```
+5.  **Commit Message Offset (`commit_message_offset`):**
+    -   After successfully publishing the result, the agent commits the offset of the consumed message to Kafka. This ensures that the message is not processed again.
 
 ## Error Handling
-- Validates JSON before publishing
-- Reports publishing errors clearly
-- No automatic retries on failure
-- Logs all operations with DEBUG level
 
-## Best Practices
-1. **Monitoring**
-   - Watch for consumer lag
-   - Monitor processing times
-   - Check error rates
+The agent includes robust error handling at each step of the workflow. If an error occurs, it is logged, and the agent will either skip the message or attempt to handle the failure gracefully. For example, if the RCA analysis fails, a default error response is generated and published.
 
-2. **Maintenance**
-   - Regularly update LLM models
-   - Review and tune prompts
-   - Adjust Kafka settings as needed
+## Metrics and Monitoring
 
-3. **Performance**
-   - Use batch processing when possible
-   - Monitor memory usage
-   - Track LLM response times
+The agent collects detailed metrics for each run, which are saved to the `rca_metrics.json` file. The `/health` endpoint provides a comprehensive overview of the agent's health.
 
-## Dependencies
-- confluent_kafka
-- langchain
-- llm_interface (local)
-- logging
+### Generated Metrics
 
-## Deployment Considerations
-1. **Scaling**
-   - Can run multiple instances
-   - Kafka partitioning for parallelism
-   - Consider LLM API limits
+The following metrics are generated and can be viewed through the `/health` endpoint:
 
-2. **Security**
-   - Secure Kafka connections
-   - API key management
-   - Log sanitization
+-   **`total_logs_processed`:** The total number of logs processed by the agent.
+-   **`total_errors`:** The total number of errors encountered by the agent.
+-   **`error_rate`:** The rate of errors, calculated as `total_errors / total_logs_processed`.
+-   **`total_input_tokens`:** The total number of input tokens used by the LLM.
+-   **`total_output_tokens`:** The total number of output tokens generated by the LLM.
+-   **`avg_tokens_per_log`:** An object containing the average number of input and output tokens per log.
+-   **`service_uptime_hours`:** The number of hours the agent has been running.
+-   **`last_run`:** Information about the last run, including its status, timestamp, function, and duration.
+-   **`recent_runs`:** A list of the last 10 runs with detailed information for each.
+-   **`average_durations`:** The average duration of the `perform_rca` and `publish_to_kafka_rca` functions, including a breakdown of the steps within each function.
 
-3. **Monitoring**
-   - Use logging for debugging
-   - Track success/failure rates
-   - Monitor resource usage
+## Configuration
+
+The agent can be configured using the following environment variables:
+
+-   `KAFKA_BOOTSTRAP_SERVERS`: The address of the Kafka bootstrap servers (e.g., `localhost:9092`).
+-   `MODEL_RUNTIME`: The LLM provider to use (e.g., `gemini`, `ollama`).
+-   Other environment variables required by the `LLMInterface` for the selected provider (e.g., `GEMINI_API_KEY`).

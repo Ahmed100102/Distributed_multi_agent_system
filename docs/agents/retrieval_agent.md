@@ -1,211 +1,85 @@
-# Retrieval Agent Documentation
+# Retrieval Agent
+
+The `retrieval_agent.py` script is the entry and exit point of the log processing pipeline. It is responsible for retrieving new error logs from Elasticsearch, initiating the analysis process, and storing the final remediation results back into Elasticsearch.
 
 ## Overview
-The Retrieval Agent manages the storage and retrieval of log analysis data using Elasticsearch. It processes remediation plans from Kafka and maintains a searchable index of all analysis results.
+
+The Retrieval Agent has two primary functions:
+
+1.  **Error Log Retrieval:** It periodically queries Elasticsearch for new error and warning logs, formats them, and publishes them to the `logs.anomalies` Kafka topic to be picked up by the RCA Agent.
+
+2.  **Remediation Storage:** It consumes the final remediation plans from the `logs.remediation` Kafka topic and stores them in a dedicated Elasticsearch index for persistence and future analysis.
 
 ## Architecture
 
-### Components
-1. **Elasticsearch Client**
-   - Manages document storage
-   - Handles search operations
-   - Maintains index templates
+The agent is built with the following components:
 
-2. **Kafka Consumer**
-   - Topic: `logs.remediation`
-   - Group: `retrieval_group`
-   - Processes remediation plans
+-   **Elasticsearch:** Used as both the source for new logs and the destination for the final results.
+-   **Kafka:** For communication with the other agents in the pipeline.
+-   **FastAPI:** To provide a `/health` endpoint for monitoring.
+-   **Asyncio:** The agent is built on Python's `asyncio` library to handle concurrent operations efficiently, such as querying Elasticsearch and consuming from Kafka.
 
-### Elasticsearch Configuration
+## Asynchronous Operations
 
-#### Index Template
-```json
-{
-    "index_patterns": ["observix-*"],
-    "template": {
-        "settings": {
-            "number_of_shards": 1,
-            "number_of_replicas": 1,
-            "refresh_interval": "1s",
-            "analysis": {
-                "analyzer": {
-                    "log_analyzer": {
-                        "type": "custom",
-                        "tokenizer": "standard",
-                        "filter": ["lowercase", "stop"]
-                    }
-                }
-            }
-        }
-    }
-}
-```
+The use of `asyncio` allows the agent to perform multiple tasks concurrently without blocking. The main functions, `run_check_new_errors` and `run_consume_remediation`, run in separate asynchronous loops, allowing the agent to continuously check for new logs while simultaneously processing incoming remediation results.
 
-#### Document Mapping
-```json
-{
-    "properties": {
-        "timestamp": {"type": "date"},
-        "log_id": {"type": "keyword"},
-        "rca": {
-            "properties": {
-                "summary": {"type": "text", "analyzer": "log_analyzer"},
-                "detailed_analysis": {"type": "text", "analyzer": "log_analyzer"},
-                "root_causes": {
-                    "type": "nested",
-                    "properties": {
-                        "cause": {"type": "text", "analyzer": "log_analyzer"},
-                        "probability": {"type": "keyword"},
-                        "impact_areas": {"type": "keyword"},
-                        "technical_details": {"type": "text", "analyzer": "log_analyzer"}
-                    }
-                }
-            }
-        },
-        "remediation_plan": {
-            "type": "nested",
-            "properties": {
-                "steps": {
-                    "type": "nested",
-                    "properties": {
-                        "step_number": {"type": "integer"},
-                        "action": {"type": "text", "analyzer": "log_analyzer"},
-                        "purpose": {"type": "text", "analyzer": "log_analyzer"}
-                    }
-                }
-            }
-        },
-        "severity": {"type": "keyword"},
-        "category": {"type": "keyword"},
-        "metadata": {
-            "properties": {
-                "source_system": {"type": "keyword"},
-                "log_level": {"type": "keyword"}
-            }
-        }
-    }
-}
-```
+## Workflow
 
-## Core Functions
+The agent operates in two parallel workflows:
 
-### check_new_errors(from_time: str = "") -> str
-Queries Elasticsearch for new error entries since the specified time.
+### 1. Error Log Retrieval
 
-#### Parameters:
-- `from_time` (str): ISO format timestamp
+-   The `check_new_errors` function queries Elasticsearch for new logs with `log_level` "ERROR" or "WARN".
+-   It formats the logs into a standardized JSON format.
+-   New logs are published to the `logs.anomalies` Kafka topic.
+-   The agent keeps track of processed log IDs to avoid duplicates.
 
-#### Returns:
-- JSON string with query results or error message
+### 2. Remediation Storage
 
-### create_or_update_index_template()
-Creates or updates the Elasticsearch index template for log data.
+-   The `consume_remediation` function consumes messages from the `logs.remediation` topic.
+-   It uses `async_bulk` to efficiently store the remediation results in a dedicated Elasticsearch index (`observix-results-*`).
+-   The agent also creates and manages an Elasticsearch index template (`observix-template`) to ensure the data is indexed correctly.
 
-### store_remediation(data: str) -> str
-Stores remediation plans in Elasticsearch.
+## Elasticsearch Integration
 
-#### Parameters:
-- `data` (str): JSON string containing remediation plan
+The agent interacts with Elasticsearch in several ways:
 
-#### Returns:
-- Success/failure status as JSON string
+-   **Querying:** It uses the `es.search` method to find new error logs.
+-   **Indexing:** It uses `async_bulk` to store remediation results.
+-   **Index Management:** It creates and updates an index template to define the mappings for the `observix-results-*` indices.
 
 ## Error Handling
-1. **Elasticsearch Errors**
-   - ApiError handling
-   - TransportError handling
-   - Connection retry logic
 
-2. **Kafka Errors**
-   - Consumer errors
-   - Message processing errors
-   - Offset management
+The agent includes error handling for both Elasticsearch and Kafka operations. If an error occurs, it is logged, and the agent will continue to run. The `/health` endpoint will reflect the status of the connections.
 
-## Example Queries
+## Metrics and Monitoring
 
-### High-Severity Issues
-```json
-GET observix-remediation-*/_search
-{
-  "query": {
-    "bool": {
-      "must": [
-        { "term": { "severity": "HIGH" } }
-      ]
-    }
-  }
-}
-```
+Metrics are collected and saved to `retrieval_metrics.json`. The `/health` endpoint (running on port 8000) provides a detailed view of the agent's status.
 
-### Root Cause Search
-```json
-GET observix-remediation-*/_search
-{
-  "query": {
-    "nested": {
-      "path": "rca.root_causes",
-      "query": {
-        "match": {
-          "rca.root_causes.cause": "network partition"
-        }
-      }
-    }
-  }
-}
-```
+### Generated Metrics
 
-## Best Practices
+The following metrics are generated and can be viewed through the `/health` endpoint:
 
-### 1. Index Management
-- Regular index cleanup
-- Optimize refresh intervals
-- Monitor shard size
-- Set appropriate replicas
+-   **`total_logs_processed`:** The total number of new logs processed by the agent.
+-   **`total_errors`:** The total number of errors encountered by the agent.
+-   **`error_rate`:** The rate of errors, calculated as `total_errors / total_runs`.
+-   **`service_uptime`:** The number of hours the agent has been running.
+-   **`last_run`:** Information about the last run, including its status, timestamp, function, and duration.
+-   **`recent_runs`:** A list of the last 10 runs with detailed information for each.
+-   **`average_durations`:** The average duration of the `check_new_errors` and `consume_remediation` functions, including a breakdown of the steps within each function.
 
-### 2. Query Optimization
-- Use appropriate field types
-- Leverage cached queries
-- Implement pagination
-- Use scroll for large results
+## Configuration
 
-### 3. Data Management
-- Implement data retention
-- Use index lifecycle policies
-- Regular backup strategy
-- Monitor disk usage
+The agent is configured through environment variables:
 
-## Environment Variables
-- `ELASTICSEARCH_URL`: Elasticsearch endpoint
-- `KAFKA_BOOTSTRAP_SERVERS`: Kafka connection
+-   `ELASTICSEARCH_URL`: The URL of the Elasticsearch cluster.
+-   `KAFKA_BOOTSTRAP_SERVERS`: The address of the Kafka bootstrap servers.
 
-## Dependencies
-- elasticsearch
-- confluent_kafka
-- datetime
-- logging
+## Persistence
 
-## Deployment Considerations
+To avoid duplicate processing, the agent maintains two sets of processed IDs:
 
-### 1. Scaling
-- Elasticsearch cluster sizing
-- Shard allocation strategy
-- Consumer group planning
+-   `processed_ids`: For logs retrieved from Elasticsearch.
+-   `processed_remediation_ids`: For remediation results stored in Elasticsearch.
 
-### 2. Monitoring
-- Index health
-- Search performance
-- Consumer lag
-- Disk usage
-
-### 3. Security
-- Elasticsearch authentication
-- Index-level security
-- Network security
-- Data encryption
-
-## Performance Tips
-1. Bulk indexing when possible
-2. Optimize refresh intervals
-3. Use appropriate mapping types
-4. Monitor and adjust JVM heap
-5. Regular performance testing
+These sets are saved to `processed_ids.json` and `processed_remediation_ids.json` respectively, and are loaded on startup.
