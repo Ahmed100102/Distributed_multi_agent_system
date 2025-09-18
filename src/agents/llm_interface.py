@@ -80,7 +80,7 @@ if __name__ == "__main__":
     # Test Gemini
     print("\nTesting Gemini:")
     try:
-        gemini_api_key = os.getenv("GEMINI_API_KEY", "AIzaSyBS7ljmFDPyP5EaP1iuAW2-eW7hmWCqZp8")  # You can also hardcode it here for testing
+        gemini_api_key = os.getenv("GEMINI_API_KEY")  # You can also hardcode it here for testing
         if not gemini_api_key:
             raise ValueError("Set GEMINI_API_KEY environment variable or provide it explicitly.")
 
